@@ -1,4 +1,4 @@
-# Meridian
+# Meridian 🌐
 
 A self-hosted, privacy-focused DNS recursive resolver written in Rust. Designed to run on a Raspberry Pi (aarch64) as a systemd service, handling all DNS resolution for your home network with network-wide ad blocking and a live terminal dashboard.
 
