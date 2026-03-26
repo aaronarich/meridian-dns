@@ -58,7 +58,10 @@ async fn main() {
             println!("Config OK: {:#?}", config);
         }
         Some(Command::Tui) => {
-            println!("TUI not yet implemented");
+            if let Err(e) = tui::run_demo(&config.tui) {
+                error!("TUI error: {e}");
+                std::process::exit(1);
+            }
         }
         None => {
             info!(mode = ?config.mode, listen = %config.listen, "starting meridian DNS resolver");
