@@ -28,7 +28,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Attach the live TUI dashboard
-    Tui,
+    Tui {
+        /// Metrics endpoint URL (default: http://127.0.0.1:<metrics_port>/)
+        #[arg(short, long)]
+        metrics_url: Option<String>,
+    },
     /// Validate config and exit
     Check,
 }
@@ -63,9 +67,11 @@ async fn main() {
         Some(Command::Check) => {
             println!("Config OK: {:#?}", config);
         }
-        Some(Command::Tui) => {
-            let metrics_url = format!("http://127.0.0.1:{}/", config.metrics.port);
-            if let Err(e) = tui::run_remote(&metrics_url, &config.tui) {
+        Some(Command::Tui { metrics_url }) => {
+            let url = metrics_url.unwrap_or_else(|| {
+                format!("http://127.0.0.1:{}/", config.metrics.port)
+            });
+            if let Err(e) = tui::run_remote(&url, &config.tui) {
                 error!("TUI error: {e}");
                 std::process::exit(1);
             }
@@ -83,17 +89,18 @@ async fn main() {
             // Spawn background refresh task
             blocklist::spawn_refresh_task(config.blocklist.clone(), shared_blocklist.clone());
 
+            let config = Arc::new(config);
+
             // Start metrics HTTP server
             if config.metrics.enabled {
                 let metrics_stats = shared_stats.clone();
                 let metrics_blocklist = shared_blocklist.clone();
                 let metrics_port = config.metrics.port;
+                let metrics_config = config.clone();
                 tokio::spawn(async move {
-                    metrics::start(metrics_port, metrics_stats, metrics_blocklist).await;
+                    metrics::start(metrics_port, metrics_stats, metrics_blocklist, metrics_config).await;
                 });
             }
-
-            let config = Arc::new(config);
 
             if let Err(e) = listener::start(config, shared_stats, shared_cache, shared_blocklist).await {
                 error!("listener error: {e}");

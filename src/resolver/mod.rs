@@ -10,12 +10,14 @@ use hickory_proto::serialize::binary::BinDecodable;
 use crate::blocklist::SharedBlocklist;
 use crate::cache::{CacheKey, SharedCache};
 use crate::config::{Config, ResolverMode, UpstreamServer};
-use crate::stats::ResolutionMethod;
+use crate::dnssec;
+use crate::stats::{DnssecStatus, ResolutionMethod};
 
 /// Result of resolving a query
 pub struct ResolveResult {
     pub response: Message,
     pub method: ResolutionMethod,
+    pub dnssec: DnssecStatus,
 }
 
 /// Try to resolve a query: check blocklist, then cache, then forward/recurse
@@ -41,6 +43,7 @@ pub async fn resolve(
                 return Ok(ResolveResult {
                     response: build_blocked_response(request),
                     method: ResolutionMethod::Blocked,
+                    dnssec: DnssecStatus::Skipped,
                 });
             }
         }
@@ -58,6 +61,7 @@ pub async fn resolve(
             return Ok(ResolveResult {
                 response: cached_msg,
                 method: ResolutionMethod::Cache,
+                dnssec: DnssecStatus::Skipped,
             });
         }
     }
@@ -72,7 +76,7 @@ pub async fn resolve(
             match recursive::resolve(request).await {
                 Ok(resp) => (resp, ResolutionMethod::Recursive),
                 Err(e) => {
-                    tracing::warn!(error = %e, "recursive resolution failed, trying forwarding fallback");
+                    tracing::debug!(error = %e, "recursive resolution fell back to forwarding");
                     if !config.upstream.servers.is_empty() {
                         let resp = forward_query(request, &config.upstream.servers).await?;
                         (resp, ResolutionMethod::Forwarding)
@@ -85,25 +89,29 @@ pub async fn resolve(
     };
 
     // Run DNSSEC validation (non-blocking, best-effort)
-    let dnssec_result = crate::dnssec::validate(&response, None).await;
-    match &dnssec_result {
-        crate::dnssec::ValidationResult::Secure => {
+    let dnssec_result = dnssec::validate(&response, None).await;
+    let dnssec_status = match &dnssec_result {
+        dnssec::ValidationResult::Secure => {
             tracing::debug!(domain = %domain, "DNSSEC: secure");
+            DnssecStatus::Secure
         }
-        crate::dnssec::ValidationResult::Insecure => {
-            tracing::debug!(domain = %domain, "DNSSEC: insecure (no DNSSEC records)");
-        }
-        crate::dnssec::ValidationResult::Bogus(reason) => {
+        dnssec::ValidationResult::Insecure => DnssecStatus::Insecure,
+        dnssec::ValidationResult::Bogus(reason) => {
             tracing::warn!(domain = %domain, reason = %reason, "DNSSEC: bogus response");
+            DnssecStatus::Bogus
         }
-    }
+    };
 
-    // Cache the response if it has answers
-    if !response.answers().is_empty() {
+    // Cache the response if it has answers or authority records
+    if !response.answers().is_empty() || !response.name_servers().is_empty() {
         cache.write().unwrap().insert(cache_key, &response);
     }
 
-    Ok(ResolveResult { response, method })
+    Ok(ResolveResult {
+        response,
+        method,
+        dnssec: dnssec_status,
+    })
 }
 
 /// Build a response that returns 0.0.0.0 for blocked domains
@@ -119,11 +127,10 @@ fn build_blocked_response(request: &Message) -> Message {
     for query in request.queries() {
         response.add_query(query.clone());
 
-        // Return 0.0.0.0 for A queries, empty for others
         if query.query_type() == RecordType::A {
             let record = Record::from_rdata(
                 query.name().clone(),
-                0, // TTL 0 so it's never cached
+                0,
                 RData::A(Ipv4Addr::new(0, 0, 0, 0).into()),
             );
             response.add_answer(record);

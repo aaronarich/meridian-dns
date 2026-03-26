@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 
 const MAX_RECURSION_DEPTH: usize = 20;
 const MAX_CNAME_CHAIN: usize = 10;
-const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Root hints — hardcoded root server addresses
 /// These are the IANA root name servers

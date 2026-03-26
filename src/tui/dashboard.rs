@@ -25,6 +25,40 @@ pub struct DashboardState {
     pub qps_history: Vec<u64>,
     pub blocklist_domain_count: usize,
     pub blocklist_last_refresh: String,
+    pub config: ConfigInfo,
+}
+
+pub struct ConfigInfo {
+    pub listen: String,
+    pub cache_max_entries: usize,
+    pub blocklist_enabled: bool,
+    pub blocklist_refresh_hours: u64,
+    pub blocklist_sources: Vec<BlocklistSourceInfo>,
+    pub upstreams: Vec<UpstreamInfo>,
+}
+
+pub struct BlocklistSourceInfo {
+    pub name: String,
+    pub url: String,
+}
+
+pub struct UpstreamInfo {
+    pub name: String,
+    pub address: String,
+    pub protocol: String,
+}
+
+impl Default for ConfigInfo {
+    fn default() -> Self {
+        Self {
+            listen: "0.0.0.0:53".to_string(),
+            cache_max_entries: 10000,
+            blocklist_enabled: true,
+            blocklist_refresh_hours: 24,
+            blocklist_sources: Vec::new(),
+            upstreams: Vec::new(),
+        }
+    }
 }
 
 pub struct RecentQuery {
@@ -32,6 +66,7 @@ pub struct RecentQuery {
     pub record_type: String,
     pub latency_ms: f64,
     pub method: String,
+    pub dnssec: String,
 }
 
 impl DashboardState {
@@ -50,6 +85,7 @@ impl DashboardState {
                 record_type: q.record_type.clone(),
                 latency_ms: q.latency_ms,
                 method: q.method.to_string(),
+                dnssec: q.dnssec.to_string(),
             })
             .collect();
 
@@ -72,6 +108,7 @@ impl DashboardState {
             qps_history,
             blocklist_domain_count: 0,
             blocklist_last_refresh: "N/A".to_string(),
+            config: ConfigInfo::default(),
         }
     }
 
@@ -115,10 +152,52 @@ impl DashboardState {
                         record_type: q["type"].as_str().unwrap_or("?").to_string(),
                         latency_ms: q["latency_ms"].as_f64().unwrap_or(0.0),
                         method: q["method"].as_str().unwrap_or("?").to_string(),
+                        dnssec: q["dnssec"].as_str().unwrap_or("?").to_string(),
                     })
                     .collect()
             })
             .unwrap_or_default();
+
+        // Parse config section
+        let cfg = &v["config"];
+        let mode = match cfg["mode"].as_str().unwrap_or("recursive") {
+            "forwarding" => ResolverMode::Forwarding,
+            _ => ResolverMode::Recursive,
+        };
+
+        let upstreams: Vec<UpstreamInfo> = cfg["upstreams"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|u| UpstreamInfo {
+                        name: u["name"].as_str().unwrap_or("?").to_string(),
+                        address: u["address"].as_str().unwrap_or("?").to_string(),
+                        protocol: u["protocol"].as_str().unwrap_or("?").to_uppercase(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let blocklist_sources: Vec<BlocklistSourceInfo> = cfg["blocklist_sources"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|s| BlocklistSourceInfo {
+                        name: s["name"].as_str().unwrap_or("?").to_string(),
+                        url: s["url"].as_str().unwrap_or("?").to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let config_info = ConfigInfo {
+            listen: cfg["listen"].as_str().unwrap_or("0.0.0.0:53").to_string(),
+            cache_max_entries: cfg["cache_max_entries"].as_u64().unwrap_or(10000) as usize,
+            blocklist_enabled: cfg["blocklist_enabled"].as_bool().unwrap_or(true),
+            blocklist_refresh_hours: cfg["blocklist_refresh_hours"].as_u64().unwrap_or(24),
+            blocklist_sources,
+            upstreams,
+        };
 
         Some(Self {
             mode,
@@ -133,6 +212,7 @@ impl DashboardState {
             qps_history: Vec::new(),
             blocklist_domain_count,
             blocklist_last_refresh,
+            config: config_info,
         })
     }
 
@@ -142,16 +222,16 @@ impl DashboardState {
         let _ = now; // suppress unused warning
 
         let recent_queries = vec![
-            RecentQuery { domain: "google.com.".into(), record_type: "A".into(), latency_ms: 12.3, method: "forwarding".into() },
-            RecentQuery { domain: "ads.doubleclick.net.".into(), record_type: "A".into(), latency_ms: 0.1, method: "blocked".into() },
-            RecentQuery { domain: "github.com.".into(), record_type: "AAAA".into(), latency_ms: 45.2, method: "recursive".into() },
-            RecentQuery { domain: "google.com.".into(), record_type: "A".into(), latency_ms: 0.2, method: "cache".into() },
-            RecentQuery { domain: "api.stripe.com.".into(), record_type: "A".into(), latency_ms: 23.1, method: "forwarding".into() },
-            RecentQuery { domain: "tracker.facebook.com.".into(), record_type: "CNAME".into(), latency_ms: 0.1, method: "blocked".into() },
-            RecentQuery { domain: "rust-lang.org.".into(), record_type: "A".into(), latency_ms: 67.8, method: "recursive".into() },
-            RecentQuery { domain: "crates.io.".into(), record_type: "A".into(), latency_ms: 0.3, method: "cache".into() },
-            RecentQuery { domain: "docs.rs.".into(), record_type: "AAAA".into(), latency_ms: 34.5, method: "forwarding".into() },
-            RecentQuery { domain: "analytics.google.com.".into(), record_type: "A".into(), latency_ms: 0.1, method: "blocked".into() },
+            RecentQuery { domain: "google.com.".into(), record_type: "A".into(), latency_ms: 12.3, method: "forwarding".into(), dnssec: "insecure".into() },
+            RecentQuery { domain: "ads.doubleclick.net.".into(), record_type: "A".into(), latency_ms: 0.1, method: "blocked".into(), dnssec: "skipped".into() },
+            RecentQuery { domain: "github.com.".into(), record_type: "AAAA".into(), latency_ms: 45.2, method: "recursive".into(), dnssec: "insecure".into() },
+            RecentQuery { domain: "google.com.".into(), record_type: "A".into(), latency_ms: 0.2, method: "cache".into(), dnssec: "skipped".into() },
+            RecentQuery { domain: "api.stripe.com.".into(), record_type: "A".into(), latency_ms: 23.1, method: "forwarding".into(), dnssec: "secure".into() },
+            RecentQuery { domain: "tracker.facebook.com.".into(), record_type: "CNAME".into(), latency_ms: 0.1, method: "blocked".into(), dnssec: "skipped".into() },
+            RecentQuery { domain: "rust-lang.org.".into(), record_type: "A".into(), latency_ms: 67.8, method: "recursive".into(), dnssec: "insecure".into() },
+            RecentQuery { domain: "crates.io.".into(), record_type: "A".into(), latency_ms: 0.3, method: "cache".into(), dnssec: "skipped".into() },
+            RecentQuery { domain: "docs.rs.".into(), record_type: "AAAA".into(), latency_ms: 34.5, method: "forwarding".into(), dnssec: "secure".into() },
+            RecentQuery { domain: "analytics.google.com.".into(), record_type: "A".into(), latency_ms: 0.1, method: "blocked".into(), dnssec: "skipped".into() },
         ];
 
         Self {
@@ -167,6 +247,20 @@ impl DashboardState {
             qps_history: vec![12, 8, 15, 22, 18, 9, 14, 25, 31, 19, 11, 7, 16, 20, 27, 13, 10, 23, 17, 14],
             blocklist_domain_count: 84_291,
             blocklist_last_refresh: "2 hours ago".to_string(),
+            config: ConfigInfo {
+                listen: "0.0.0.0:53".to_string(),
+                cache_max_entries: 10000,
+                blocklist_enabled: true,
+                blocklist_refresh_hours: 24,
+                blocklist_sources: vec![
+                    BlocklistSourceInfo { name: "stevenblack".into(), url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts".into() },
+                    BlocklistSourceInfo { name: "peter-lowe".into(), url: "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts".into() },
+                ],
+                upstreams: vec![
+                    UpstreamInfo { name: "quad9".into(), address: "9.9.9.9".into(), protocol: "DOT".into() },
+                    UpstreamInfo { name: "cloudflare".into(), address: "1.1.1.1".into(), protocol: "DOQ".into() },
+                ],
+            },
         }
     }
 }
@@ -188,19 +282,21 @@ fn format_uptime(d: Duration) -> String {
 pub fn render(frame: &mut Frame, state: &DashboardState) {
     let size = frame.area();
 
-    // Top-level layout: header, middle, footer
+    // Top-level layout: header, middle, config, footer
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(5),  // header: mode + stats
             Constraint::Min(10),   // middle: chart + query log
-            Constraint::Length(3), // footer: blocklist + keybinds
+            Constraint::Length(8), // config: settings panel
+            Constraint::Length(3), // footer: keybinds
         ])
         .split(size);
 
     render_header(frame, outer[0], state);
     render_middle(frame, outer[1], state);
-    render_footer(frame, outer[2], state);
+    render_config(frame, outer[2], state);
+    render_footer(frame, outer[3], state);
 }
 
 fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
@@ -346,6 +442,7 @@ fn render_query_log(frame: &mut Frame, area: Rect, state: &DashboardState) {
         Cell::from("Type").style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
         Cell::from("Latency").style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
         Cell::from("Method").style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+        Cell::from("DNSSEC").style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
     ])
     .height(1);
 
@@ -361,11 +458,19 @@ fn render_query_log(frame: &mut Frame, area: Rect, state: &DashboardState) {
                 _ => Color::White,
             };
 
+            let dnssec_color = match q.dnssec.as_str() {
+                "secure" => Color::Green,
+                "insecure" => Color::Yellow,
+                "bogus" => Color::Red,
+                _ => Color::DarkGray,
+            };
+
             Row::new(vec![
                 Cell::from(truncate_domain(&q.domain, 35)),
                 Cell::from(q.record_type.as_str()),
                 Cell::from(format!("{:.1}ms", q.latency_ms)),
                 Cell::from(q.method.as_str()).style(Style::default().fg(method_color)),
+                Cell::from(q.dnssec.as_str()).style(Style::default().fg(dnssec_color)),
             ])
         })
         .collect();
@@ -377,6 +482,7 @@ fn render_query_log(frame: &mut Frame, area: Rect, state: &DashboardState) {
             Constraint::Length(6),
             Constraint::Length(10),
             Constraint::Length(12),
+            Constraint::Length(10),
         ],
     )
     .header(header)
@@ -388,6 +494,69 @@ fn render_query_log(frame: &mut Frame, area: Rect, state: &DashboardState) {
     .row_highlight_style(Style::default().add_modifier(Modifier::BOLD));
 
     frame.render_widget(table, area);
+}
+
+fn render_config(frame: &mut Frame, area: Rect, state: &DashboardState) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(50), // Upstreams
+            Constraint::Percentage(50), // Blocklist sources
+        ])
+        .split(area);
+
+    // Upstream servers panel
+    let mut upstream_lines = Vec::new();
+    for u in &state.config.upstreams {
+        upstream_lines.push(Line::from(vec![
+            Span::styled(&u.name, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled("  ", Style::default()),
+            Span::styled(&u.address, Style::default().fg(Color::White)),
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                &u.protocol,
+                Style::default().fg(match u.protocol.as_str() {
+                    "DOT" => Color::Green,
+                    "DOH" => Color::Blue,
+                    "DOQ" => Color::Magenta,
+                    _ => Color::White,
+                }),
+            ),
+        ]));
+    }
+    if upstream_lines.is_empty() {
+        upstream_lines.push(Line::from(Span::styled(
+            "  (none configured)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let upstreams = Paragraph::new(upstream_lines)
+        .block(Block::default().borders(Borders::ALL).title(" Upstream Servers "));
+    frame.render_widget(upstreams, chunks[0]);
+
+    // Blocklist sources panel
+    let mut bl_lines = Vec::new();
+    for s in &state.config.blocklist_sources {
+        bl_lines.push(Line::from(vec![
+            Span::styled(&s.name, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                truncate_url(&s.url, (chunks[1].width.saturating_sub(s.name.len() as u16 + 6)) as usize),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    if bl_lines.is_empty() {
+        bl_lines.push(Line::from(Span::styled(
+            "  (none configured)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let blocklists = Paragraph::new(bl_lines)
+        .block(Block::default().borders(Borders::ALL).title(" Blocklist Sources "));
+    frame.render_widget(blocklists, chunks[1]);
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, state: &DashboardState) {
@@ -420,5 +589,16 @@ fn truncate_domain(domain: &str, max_len: usize) -> String {
         domain.to_string()
     } else {
         format!("...{}", &domain[domain.len() - (max_len - 3)..])
+    }
+}
+
+fn truncate_url(url: &str, max_len: usize) -> String {
+    if max_len < 10 {
+        return "...".to_string();
+    }
+    if url.len() <= max_len {
+        url.to_string()
+    } else {
+        format!("{}...", &url[..max_len - 3])
     }
 }

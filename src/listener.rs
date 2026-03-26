@@ -12,7 +12,7 @@ use crate::blocklist::SharedBlocklist;
 use crate::cache::SharedCache;
 use crate::config::Config;
 use crate::resolver;
-use crate::stats::{QueryLogEntry, ResolutionMethod, SharedStats};
+use crate::stats::{DnssecStatus, QueryLogEntry, ResolutionMethod, SharedStats};
 
 /// Shared context passed to query handlers
 #[derive(Clone)]
@@ -175,17 +175,17 @@ async fn handle_query(buf: &[u8], ctx: &HandlerCtx) -> Vec<u8> {
     let query_start = Instant::now();
 
     // Try to resolve the query
-    let (response_bytes, method) =
+    let (response_bytes, method, dnssec_status) =
         match resolver::resolve(&request, &ctx.config, &ctx.cache, &ctx.blocklist).await {
             Ok(result) => {
                 let bytes = result.response.to_vec().unwrap_or_else(|_| {
                     build_servfail(id, &request)
                 });
-                (bytes, result.method)
+                (bytes, result.method, result.dnssec)
             }
             Err(e) => {
                 warn!(domain = %domain, error = %e, "resolution failed");
-                (build_servfail(id, &request), ResolutionMethod::Forwarding)
+                (build_servfail(id, &request), ResolutionMethod::Forwarding, DnssecStatus::Skipped)
             }
         };
 
@@ -206,6 +206,7 @@ async fn handle_query(buf: &[u8], ctx: &HandlerCtx) -> Vec<u8> {
             record_type,
             latency_ms,
             method,
+            dnssec: dnssec_status,
             timestamp: query_start,
         });
     }

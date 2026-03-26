@@ -29,7 +29,28 @@ pub struct QueryLogEntry {
     pub record_type: String,
     pub latency_ms: f64,
     pub method: ResolutionMethod,
+    pub dnssec: DnssecStatus,
     pub timestamp: Instant,
+}
+
+/// DNSSEC validation status for a query
+#[derive(Debug, Clone)]
+pub enum DnssecStatus {
+    Secure,
+    Insecure,
+    Bogus,
+    Skipped,
+}
+
+impl std::fmt::Display for DnssecStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DnssecStatus::Secure => write!(f, "secure"),
+            DnssecStatus::Insecure => write!(f, "insecure"),
+            DnssecStatus::Bogus => write!(f, "bogus"),
+            DnssecStatus::Skipped => write!(f, "skipped"),
+        }
+    }
 }
 
 /// Shared resolver statistics
@@ -104,6 +125,7 @@ mod tests {
                 record_type: "A".to_string(),
                 latency_ms: 12.5,
                 method: ResolutionMethod::Forwarding,
+                dnssec: DnssecStatus::Skipped,
                 timestamp: Instant::now(),
             });
             s.record_query(QueryLogEntry {
@@ -111,6 +133,7 @@ mod tests {
                 record_type: "A".to_string(),
                 latency_ms: 0.1,
                 method: ResolutionMethod::Blocked,
+                dnssec: DnssecStatus::Skipped,
                 timestamp: Instant::now(),
             });
             s.record_query(QueryLogEntry {
@@ -118,6 +141,7 @@ mod tests {
                 record_type: "A".to_string(),
                 latency_ms: 0.2,
                 method: ResolutionMethod::Cache,
+                dnssec: DnssecStatus::Skipped,
                 timestamp: Instant::now(),
             });
         }

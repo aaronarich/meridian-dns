@@ -3,9 +3,10 @@ use std::sync::Arc;
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-use tracing::{error, info, debug};
+use tracing::{debug, error, info};
 
 use crate::blocklist::SharedBlocklist;
+use crate::config::Config;
 use crate::stats::SharedStats;
 
 /// Start the metrics HTTP server
@@ -13,6 +14,7 @@ pub async fn start(
     port: u16,
     stats: SharedStats,
     blocklist: SharedBlocklist,
+    config: Arc<Config>,
 ) {
     let addr: SocketAddr = ([0, 0, 0, 0], port).into();
 
@@ -38,13 +40,13 @@ pub async fn start(
 
         let stats = stats.clone();
         let blocklist = blocklist.clone();
+        let config = config.clone();
 
         tokio::spawn(async move {
-            // Read the HTTP request (we don't really need to parse it)
             let mut buf = vec![0u8; 4096];
             let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
 
-            let body = build_metrics_json(&stats, &blocklist);
+            let body = build_metrics_json(&stats, &blocklist, &config);
 
             let response = format!(
                 "HTTP/1.1 200 OK\r\n\
@@ -63,14 +65,15 @@ pub async fn start(
     }
 }
 
-fn build_metrics_json(stats: &SharedStats, blocklist: &SharedBlocklist) -> String {
+fn build_metrics_json(
+    stats: &SharedStats,
+    blocklist: &SharedBlocklist,
+    config: &Config,
+) -> String {
     let s = stats.read().unwrap();
     let uptime_secs = s.start_time.elapsed().as_secs();
 
-    let blocklist_count = blocklist
-        .read()
-        .map(|b| b.domain_count)
-        .unwrap_or(0);
+    let blocklist_count = blocklist.read().map(|b| b.domain_count).unwrap_or(0);
 
     let blocklist_last_refresh = blocklist
         .read()
@@ -86,17 +89,56 @@ fn build_metrics_json(stats: &SharedStats, blocklist: &SharedBlocklist) -> Strin
         .take(20)
         .map(|q| {
             format!(
-                r#"{{"domain":"{}","type":"{}","latency_ms":{:.2},"method":"{}"}}"#,
+                r#"{{"domain":"{}","type":"{}","latency_ms":{:.2},"method":"{}","dnssec":"{}"}}"#,
                 escape_json(&q.domain),
                 escape_json(&q.record_type),
                 q.latency_ms,
                 q.method,
+                q.dnssec,
+            )
+        })
+        .collect();
+
+    // Build config section
+    let mode = match config.mode {
+        crate::config::ResolverMode::Recursive => "recursive",
+        crate::config::ResolverMode::Forwarding => "forwarding",
+    };
+
+    let upstreams: Vec<String> = config
+        .upstream
+        .servers
+        .iter()
+        .map(|s| {
+            let protocol = match s.protocol {
+                crate::config::UpstreamProtocol::Dot => "dot",
+                crate::config::UpstreamProtocol::Doh => "doh",
+                crate::config::UpstreamProtocol::Doq => "doq",
+            };
+            format!(
+                r#"{{"name":"{}","address":"{}","protocol":"{}"}}"#,
+                escape_json(&s.name),
+                escape_json(&s.address),
+                protocol,
+            )
+        })
+        .collect();
+
+    let blocklist_sources: Vec<String> = config
+        .blocklist
+        .sources
+        .iter()
+        .map(|s| {
+            format!(
+                r#"{{"name":"{}","url":"{}"}}"#,
+                escape_json(&s.name),
+                escape_json(&s.url),
             )
         })
         .collect();
 
     format!(
-        r#"{{"uptime_secs":{},"total_queries":{},"cache_hits":{},"cache_hit_rate":{:.1},"blocked_queries":{},"forwarded_queries":{},"recursive_queries":{},"blocklist_domains":{},"blocklist_last_refresh_secs_ago":{},"recent_queries":[{}]}}"#,
+        r#"{{"uptime_secs":{},"total_queries":{},"cache_hits":{},"cache_hit_rate":{:.1},"blocked_queries":{},"forwarded_queries":{},"recursive_queries":{},"blocklist_domains":{},"blocklist_last_refresh_secs_ago":{},"recent_queries":[{}],"config":{{"mode":"{}","listen":"{}","cache_max_entries":{},"blocklist_enabled":{},"blocklist_refresh_hours":{},"blocklist_sources":[{}],"upstreams":[{}]}}}}"#,
         uptime_secs,
         s.total_queries,
         s.cache_hits,
@@ -107,6 +149,13 @@ fn build_metrics_json(stats: &SharedStats, blocklist: &SharedBlocklist) -> Strin
         blocklist_count,
         blocklist_last_refresh,
         recent.join(","),
+        mode,
+        config.listen,
+        config.cache.max_entries,
+        config.blocklist.enabled,
+        config.blocklist.refresh_interval_hours,
+        blocklist_sources.join(","),
+        upstreams.join(","),
     )
 }
 
@@ -120,24 +169,42 @@ fn escape_json(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::blocklist::new_shared_blocklist;
-    use crate::stats::{new_shared_stats, QueryLogEntry, ResolutionMethod};
+    use crate::stats::{new_shared_stats, DnssecStatus, QueryLogEntry, ResolutionMethod};
     use std::time::Instant;
+
+    fn test_config() -> Arc<Config> {
+        let config: Config = toml::from_str(
+            r#"
+mode = "recursive"
+[[upstream.servers]]
+name = "quad9"
+address = "9.9.9.9"
+protocol = "dot"
+"#,
+        )
+        .unwrap();
+        Arc::new(config)
+    }
 
     #[test]
     fn metrics_json_empty() {
         let stats = new_shared_stats();
         let blocklist = new_shared_blocklist();
-        let json = build_metrics_json(&stats, &blocklist);
+        let config = test_config();
+        let json = build_metrics_json(&stats, &blocklist, &config);
 
         assert!(json.contains("\"total_queries\":0"));
         assert!(json.contains("\"cache_hit_rate\":0.0"));
         assert!(json.contains("\"recent_queries\":[]"));
+        assert!(json.contains("\"mode\":\"recursive\""));
+        assert!(json.contains("\"quad9\""));
     }
 
     #[test]
     fn metrics_json_with_queries() {
         let stats = new_shared_stats();
         let blocklist = new_shared_blocklist();
+        let config = test_config();
 
         {
             let mut s = stats.write().unwrap();
@@ -146,11 +213,12 @@ mod tests {
                 record_type: "A".to_string(),
                 latency_ms: 42.5,
                 method: ResolutionMethod::Forwarding,
+                dnssec: DnssecStatus::Insecure,
                 timestamp: Instant::now(),
             });
         }
 
-        let json = build_metrics_json(&stats, &blocklist);
+        let json = build_metrics_json(&stats, &blocklist, &config);
         assert!(json.contains("\"total_queries\":1"));
         assert!(json.contains("\"forwarded_queries\":1"));
         assert!(json.contains("example.com"));
