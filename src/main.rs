@@ -82,6 +82,16 @@ async fn main() {
             // Spawn background refresh task
             blocklist::spawn_refresh_task(config.blocklist.clone(), shared_blocklist.clone());
 
+            // Start metrics HTTP server
+            if config.metrics.enabled {
+                let metrics_stats = shared_stats.clone();
+                let metrics_blocklist = shared_blocklist.clone();
+                let metrics_port = config.metrics.port;
+                tokio::spawn(async move {
+                    metrics::start(metrics_port, metrics_stats, metrics_blocklist).await;
+                });
+            }
+
             let config = Arc::new(config);
 
             if let Err(e) = listener::start(config, shared_stats, shared_cache, shared_blocklist).await {
