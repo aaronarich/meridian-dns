@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Instant;
 
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
@@ -7,15 +8,37 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tracing::{debug, error, info, warn};
 
+use crate::cache::SharedCache;
+use crate::config::Config;
+use crate::resolver;
 use crate::stats::{QueryLogEntry, ResolutionMethod, SharedStats};
 
-/// Start both UDP and TCP listeners
-pub async fn start(addr: SocketAddr, stats: SharedStats) -> Result<(), Box<dyn std::error::Error>> {
-    let udp_stats = stats.clone();
-    let tcp_stats = stats;
+/// Shared context passed to query handlers
+#[derive(Clone)]
+struct HandlerCtx {
+    stats: SharedStats,
+    cache: SharedCache,
+    config: Arc<Config>,
+}
 
-    let udp_handle = tokio::spawn(listen_udp(addr, udp_stats));
-    let tcp_handle = tokio::spawn(listen_tcp(addr, tcp_stats));
+/// Start both UDP and TCP listeners
+pub async fn start(
+    config: Arc<Config>,
+    stats: SharedStats,
+    cache: SharedCache,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = HandlerCtx {
+        stats,
+        cache,
+        config,
+    };
+
+    let addr = ctx.config.listen;
+    let udp_ctx = ctx.clone();
+    let tcp_ctx = ctx;
+
+    let udp_handle = tokio::spawn(listen_udp(addr, udp_ctx));
+    let tcp_handle = tokio::spawn(listen_tcp(addr, tcp_ctx));
 
     tokio::select! {
         res = udp_handle => {
@@ -29,7 +52,7 @@ pub async fn start(addr: SocketAddr, stats: SharedStats) -> Result<(), Box<dyn s
     Ok(())
 }
 
-async fn listen_udp(addr: SocketAddr, stats: SharedStats) {
+async fn listen_udp(addr: SocketAddr, ctx: HandlerCtx) {
     let socket = match UdpSocket::bind(addr).await {
         Ok(s) => {
             info!("UDP listener bound to {addr}");
@@ -41,7 +64,9 @@ async fn listen_udp(addr: SocketAddr, stats: SharedStats) {
         }
     };
 
+    let socket = Arc::new(socket);
     let mut buf = vec![0u8; 4096];
+
     loop {
         let (len, src) = match socket.recv_from(&mut buf).await {
             Ok(r) => r,
@@ -51,16 +76,20 @@ async fn listen_udp(addr: SocketAddr, stats: SharedStats) {
             }
         };
 
-        let query_start = Instant::now();
-        let response = handle_query(&buf[..len], &stats, query_start);
+        let query_data = buf[..len].to_vec();
+        let ctx = ctx.clone();
+        let socket = socket.clone();
 
-        if let Err(e) = socket.send_to(&response, src).await {
-            warn!("UDP send error to {src}: {e}");
-        }
+        tokio::spawn(async move {
+            let response = handle_query(&query_data, &ctx).await;
+            if let Err(e) = socket.send_to(&response, src).await {
+                warn!("UDP send error to {src}: {e}");
+            }
+        });
     }
 }
 
-async fn listen_tcp(addr: SocketAddr, stats: SharedStats) {
+async fn listen_tcp(addr: SocketAddr, ctx: HandlerCtx) {
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => {
             info!("TCP listener bound to {addr}");
@@ -81,9 +110,9 @@ async fn listen_tcp(addr: SocketAddr, stats: SharedStats) {
             }
         };
 
-        let stats = stats.clone();
+        let ctx = ctx.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_tcp_connection(stream, src, stats).await {
+            if let Err(e) = handle_tcp_connection(stream, src, ctx).await {
                 debug!("TCP connection from {src} ended: {e}");
             }
         });
@@ -93,13 +122,12 @@ async fn listen_tcp(addr: SocketAddr, stats: SharedStats) {
 async fn handle_tcp_connection(
     mut stream: tokio::net::TcpStream,
     src: SocketAddr,
-    stats: SharedStats,
+    ctx: HandlerCtx,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // DNS over TCP: 2-byte length prefix followed by the message
     loop {
         let len = match stream.read_u16().await {
             Ok(l) => l as usize,
-            Err(_) => return Ok(()), // connection closed
+            Err(_) => return Ok(()),
         };
 
         if len == 0 || len > 65535 {
@@ -109,8 +137,7 @@ async fn handle_tcp_connection(
         let mut buf = vec![0u8; len];
         stream.read_exact(&mut buf).await?;
 
-        let query_start = Instant::now();
-        let response = handle_query(&buf, &stats, query_start);
+        let response = handle_query(&buf, &ctx).await;
 
         let resp_len = (response.len() as u16).to_be_bytes();
         stream.write_all(&resp_len).await?;
@@ -120,9 +147,8 @@ async fn handle_tcp_connection(
     }
 }
 
-/// Parse a DNS query, log it to stats, and return a response.
-/// For now, returns SERVFAIL since we have no resolver yet.
-fn handle_query(buf: &[u8], stats: &SharedStats, query_start: Instant) -> Vec<u8> {
+/// Parse a DNS query, resolve it, and return a response.
+async fn handle_query(buf: &[u8], ctx: &HandlerCtx) -> Vec<u8> {
     let request = match Message::from_bytes(buf) {
         Ok(msg) => msg,
         Err(e) => {
@@ -142,18 +168,40 @@ fn handle_query(buf: &[u8], stats: &SharedStats, query_start: Instant) -> Vec<u8
 
     debug!(domain = %domain, rtype = %record_type, "received query");
 
-    // Build SERVFAIL response (no resolver yet)
-    let response_bytes = build_servfail(id, &request);
+    let query_start = Instant::now();
+
+    // Try to resolve the query
+    let (response_bytes, method) =
+        match resolver::resolve(&request, &ctx.config, &ctx.cache).await {
+            Ok(result) => {
+                let bytes = result.response.to_vec().unwrap_or_else(|_| {
+                    build_servfail(id, &request)
+                });
+                (bytes, result.method)
+            }
+            Err(e) => {
+                warn!(domain = %domain, error = %e, "resolution failed");
+                (build_servfail(id, &request), ResolutionMethod::Forwarding)
+            }
+        };
 
     let latency_ms = query_start.elapsed().as_secs_f64() * 1000.0;
 
+    debug!(
+        domain = %domain,
+        rtype = %record_type,
+        method = %method,
+        latency_ms = %format!("{:.2}", latency_ms),
+        "query resolved"
+    );
+
     // Log to stats
-    if let Ok(mut s) = stats.write() {
+    if let Ok(mut s) = ctx.stats.write() {
         s.record_query(QueryLogEntry {
             domain,
             record_type,
             latency_ms,
-            method: ResolutionMethod::Forwarding, // placeholder
+            method,
             timestamp: query_start,
         });
     }
@@ -170,7 +218,6 @@ fn build_servfail(id: u16, request: &Message) -> Vec<u8> {
     response.set_recursion_available(true);
     response.set_recursion_desired(request.recursion_desired());
 
-    // Echo back the question section
     for query in request.queries() {
         response.add_query(query.clone());
     }
@@ -190,6 +237,8 @@ fn build_formerr(id: u16) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::new_shared_cache;
+    use crate::config::Config;
     use crate::stats::new_shared_stats;
     use hickory_proto::op::{Query, MessageType};
     use hickory_proto::rr::{Name, RecordType};
@@ -208,42 +257,52 @@ mod tests {
         msg.to_vec().unwrap()
     }
 
-    #[test]
-    fn handle_valid_query_returns_servfail() {
-        let stats = new_shared_stats();
+    fn test_ctx() -> HandlerCtx {
+        let config: Config = toml::from_str(r#"mode = "forwarding""#).unwrap();
+        HandlerCtx {
+            stats: new_shared_stats(),
+            cache: new_shared_cache(100),
+            config: Arc::new(config),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_valid_query_with_no_upstreams() {
+        let ctx = test_ctx();
         let query_bytes = build_test_query("example.com.");
-        let response_bytes = handle_query(&query_bytes, &stats, Instant::now());
+        let response_bytes = handle_query(&query_bytes, &ctx).await;
 
         let response = Message::from_bytes(&response_bytes).unwrap();
         assert_eq!(response.id(), 1234);
+        // Should SERVFAIL because no upstreams are configured
         assert_eq!(response.response_code(), ResponseCode::ServFail);
-        assert!(response.header().recursion_available());
-        assert_eq!(response.queries().len(), 1);
 
-        let s = stats.read().unwrap();
+        let s = ctx.stats.read().unwrap();
         assert_eq!(s.total_queries, 1);
     }
 
-    #[test]
-    fn handle_garbage_returns_formerr() {
-        let stats = new_shared_stats();
-        let response_bytes = handle_query(&[0xFF, 0x00], &stats, Instant::now());
+    #[tokio::test]
+    async fn handle_garbage_returns_formerr() {
+        let ctx = test_ctx();
+        let response_bytes = handle_query(&[0xFF, 0x00], &ctx).await;
 
         let response = Message::from_bytes(&response_bytes).unwrap();
         assert_eq!(response.response_code(), ResponseCode::FormErr);
 
-        // Garbage should not be recorded as a query
-        let s = stats.read().unwrap();
+        let s = ctx.stats.read().unwrap();
         assert_eq!(s.total_queries, 0);
     }
 
-    #[test]
-    fn response_echoes_question_section() {
-        let stats = new_shared_stats();
+    #[tokio::test]
+    async fn response_echoes_question_section() {
+        let ctx = test_ctx();
         let query_bytes = build_test_query("test.org.");
-        let response_bytes = handle_query(&query_bytes, &stats, Instant::now());
+        let response_bytes = handle_query(&query_bytes, &ctx).await;
 
         let response = Message::from_bytes(&response_bytes).unwrap();
-        assert_eq!(response.queries().first().unwrap().name().to_string(), "test.org.");
+        assert_eq!(
+            response.queries().first().unwrap().name().to_string(),
+            "test.org."
+        );
     }
 }

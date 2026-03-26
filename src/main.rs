@@ -8,6 +8,8 @@ mod resolver;
 mod stats;
 mod tui;
 
+use std::sync::Arc;
+
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tracing::{error, info};
@@ -33,6 +35,10 @@ enum Command {
 
 #[tokio::main]
 async fn main() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install default crypto provider");
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -67,8 +73,10 @@ async fn main() {
             info!(mode = ?config.mode, listen = %config.listen, "starting meridian DNS resolver");
 
             let shared_stats = stats::new_shared_stats();
+            let shared_cache = cache::new_shared_cache(config.cache.max_entries);
+            let config = Arc::new(config);
 
-            if let Err(e) = listener::start(config.listen, shared_stats).await {
+            if let Err(e) = listener::start(config, shared_stats, shared_cache).await {
                 error!("listener error: {e}");
                 std::process::exit(1);
             }

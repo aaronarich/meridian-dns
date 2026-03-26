@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Bar, BarChart, BarGroup, Block, Borders, Cell, Paragraph, Row, Table, Wrap,

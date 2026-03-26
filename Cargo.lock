@@ -975,9 +975,11 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "webpki-roots",
 ]
 
 [[package]]
