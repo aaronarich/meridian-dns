@@ -74,9 +74,17 @@ async fn main() {
 
             let shared_stats = stats::new_shared_stats();
             let shared_cache = cache::new_shared_cache(config.cache.max_entries);
+            let shared_blocklist = blocklist::new_shared_blocklist();
+
+            // Load blocklists on startup
+            blocklist::load(&config.blocklist, &shared_blocklist).await;
+
+            // Spawn background refresh task
+            blocklist::spawn_refresh_task(config.blocklist.clone(), shared_blocklist.clone());
+
             let config = Arc::new(config);
 
-            if let Err(e) = listener::start(config, shared_stats, shared_cache).await {
+            if let Err(e) = listener::start(config, shared_stats, shared_cache, shared_blocklist).await {
                 error!("listener error: {e}");
                 std::process::exit(1);
             }

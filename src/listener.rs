@@ -8,6 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tracing::{debug, error, info, warn};
 
+use crate::blocklist::SharedBlocklist;
 use crate::cache::SharedCache;
 use crate::config::Config;
 use crate::resolver;
@@ -19,6 +20,7 @@ struct HandlerCtx {
     stats: SharedStats,
     cache: SharedCache,
     config: Arc<Config>,
+    blocklist: SharedBlocklist,
 }
 
 /// Start both UDP and TCP listeners
@@ -26,11 +28,13 @@ pub async fn start(
     config: Arc<Config>,
     stats: SharedStats,
     cache: SharedCache,
+    blocklist: SharedBlocklist,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ctx = HandlerCtx {
         stats,
         cache,
         config,
+        blocklist,
     };
 
     let addr = ctx.config.listen;
@@ -172,7 +176,7 @@ async fn handle_query(buf: &[u8], ctx: &HandlerCtx) -> Vec<u8> {
 
     // Try to resolve the query
     let (response_bytes, method) =
-        match resolver::resolve(&request, &ctx.config, &ctx.cache).await {
+        match resolver::resolve(&request, &ctx.config, &ctx.cache, &ctx.blocklist).await {
             Ok(result) => {
                 let bytes = result.response.to_vec().unwrap_or_else(|_| {
                     build_servfail(id, &request)
@@ -237,6 +241,7 @@ fn build_formerr(id: u16) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blocklist::new_shared_blocklist;
     use crate::cache::new_shared_cache;
     use crate::config::Config;
     use crate::stats::new_shared_stats;
@@ -263,6 +268,7 @@ mod tests {
             stats: new_shared_stats(),
             cache: new_shared_cache(100),
             config: Arc::new(config),
+            blocklist: new_shared_blocklist(),
         }
     }
 
