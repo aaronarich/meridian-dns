@@ -63,19 +63,25 @@ pub async fn resolve(
     }
 
     // Resolve based on mode
-    let response = match config.mode {
+    let (response, method) = match config.mode {
         ResolverMode::Forwarding => {
-            forward_query(request, &config.upstream.servers).await?
+            let resp = forward_query(request, &config.upstream.servers).await?;
+            (resp, ResolutionMethod::Forwarding)
         }
         ResolverMode::Recursive => {
-            // Fall back to forwarding for now (recursive not yet implemented)
-            forward_query(request, &config.upstream.servers).await?
+            match recursive::resolve(request).await {
+                Ok(resp) => (resp, ResolutionMethod::Recursive),
+                Err(e) => {
+                    tracing::warn!(error = %e, "recursive resolution failed, trying forwarding fallback");
+                    if !config.upstream.servers.is_empty() {
+                        let resp = forward_query(request, &config.upstream.servers).await?;
+                        (resp, ResolutionMethod::Forwarding)
+                    } else {
+                        return Err(e.into());
+                    }
+                }
+            }
         }
-    };
-
-    let method = match config.mode {
-        ResolverMode::Forwarding => ResolutionMethod::Forwarding,
-        ResolverMode::Recursive => ResolutionMethod::Recursive,
     };
 
     // Cache the response if it has answers
