@@ -64,7 +64,8 @@ async fn main() {
             println!("Config OK: {:#?}", config);
         }
         Some(Command::Tui) => {
-            if let Err(e) = tui::run_demo(&config.tui) {
+            let metrics_url = format!("http://127.0.0.1:{}/", config.metrics.port);
+            if let Err(e) = tui::run_remote(&metrics_url, &config.tui) {
                 error!("TUI error: {e}");
                 std::process::exit(1);
             }

@@ -75,6 +75,67 @@ impl DashboardState {
         }
     }
 
+    /// Build state from the metrics JSON endpoint response
+    pub fn from_json(json: &str) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_str(json).ok()?;
+
+        let uptime_secs = v["uptime_secs"].as_u64().unwrap_or(0);
+        let total_queries = v["total_queries"].as_u64().unwrap_or(0);
+        let cache_hits = v["cache_hits"].as_u64().unwrap_or(0);
+        let cache_hit_rate = v["cache_hit_rate"].as_f64().unwrap_or(0.0);
+        let blocked_queries = v["blocked_queries"].as_u64().unwrap_or(0);
+        let forwarded_queries = v["forwarded_queries"].as_u64().unwrap_or(0);
+        let recursive_queries = v["recursive_queries"].as_u64().unwrap_or(0);
+        let blocklist_domain_count = v["blocklist_domains"].as_u64().unwrap_or(0) as usize;
+        let refresh_secs = v["blocklist_last_refresh_secs_ago"].as_u64().unwrap_or(0);
+
+        let blocklist_last_refresh = if refresh_secs == 0 {
+            "N/A".to_string()
+        } else if refresh_secs < 60 {
+            format!("{refresh_secs}s ago")
+        } else if refresh_secs < 3600 {
+            format!("{}m ago", refresh_secs / 60)
+        } else {
+            format!("{}h ago", refresh_secs / 3600)
+        };
+
+        // Determine mode from which counter is higher
+        let mode = if recursive_queries >= forwarded_queries {
+            ResolverMode::Recursive
+        } else {
+            ResolverMode::Forwarding
+        };
+
+        let recent_queries: Vec<RecentQuery> = v["recent_queries"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|q| RecentQuery {
+                        domain: q["domain"].as_str().unwrap_or("?").to_string(),
+                        record_type: q["type"].as_str().unwrap_or("?").to_string(),
+                        latency_ms: q["latency_ms"].as_f64().unwrap_or(0.0),
+                        method: q["method"].as_str().unwrap_or("?").to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Some(Self {
+            mode,
+            uptime: Duration::from_secs(uptime_secs),
+            total_queries,
+            cache_hits,
+            cache_hit_rate,
+            blocked_queries,
+            forwarded_queries,
+            recursive_queries,
+            recent_queries,
+            qps_history: Vec::new(),
+            blocklist_domain_count,
+            blocklist_last_refresh,
+        })
+    }
+
     /// Build a demo state for testing the UI
     pub fn demo() -> Self {
         let now = Instant::now();
