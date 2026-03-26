@@ -6,10 +6,11 @@ description = "A privacy-focused DNS recursive resolver"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-hickory-proto = "0.25"
+hickory-proto = { version = "0.25", features = ["dnssec-ring"] }
 rustls = { version = "0.23", features = ["ring"] }
 reqwest = { version = "0.12", features = ["rustls-tls", "blocking"], default-features = false }
 quinn = "0.11"
+ring = "0.17"
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"

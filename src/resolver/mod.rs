@@ -84,6 +84,20 @@ pub async fn resolve(
         }
     };
 
+    // Run DNSSEC validation (non-blocking, best-effort)
+    let dnssec_result = crate::dnssec::validate(&response, None).await;
+    match &dnssec_result {
+        crate::dnssec::ValidationResult::Secure => {
+            tracing::debug!(domain = %domain, "DNSSEC: secure");
+        }
+        crate::dnssec::ValidationResult::Insecure => {
+            tracing::debug!(domain = %domain, "DNSSEC: insecure (no DNSSEC records)");
+        }
+        crate::dnssec::ValidationResult::Bogus(reason) => {
+            tracing::warn!(domain = %domain, reason = %reason, "DNSSEC: bogus response");
+        }
+    }
+
     // Cache the response if it has answers
     if !response.answers().is_empty() {
         cache.write().unwrap().insert(cache_key, &response);
