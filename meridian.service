@@ -1,0 +1,20 @@
+[Unit]
+Description=Meridian DNS Resolver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/meridian --config /etc/meridian/meridian.toml
+Restart=on-failure
+RestartSec=5
+User=meridian
+Group=meridian
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/etc/meridian
+
+[Install]
+WantedBy=multi-user.target

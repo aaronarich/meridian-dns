@@ -1,0 +1,20 @@
+[package]
+name = "meridian"
+version = "0.1.0"
+edition = "2021"
+description = "A privacy-focused DNS recursive resolver"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+hickory-proto = "0.25"
+rustls = "0.23"
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
+quinn = "0.11"
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ratatui = "0.29"
+crossterm = "0.28"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"

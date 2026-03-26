@@ -1,0 +1,10 @@
+services:
+  meridian:
+    build: .
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+      - "9053:9053/tcp"
+    volumes:
+      - ./meridian.toml.example:/etc/meridian/meridian.toml:ro
+    restart: unless-stopped
