@@ -76,13 +76,8 @@ pub async fn resolve(
             match recursive::resolve(request).await {
                 Ok(resp) => (resp, ResolutionMethod::Recursive),
                 Err(e) => {
-                    tracing::debug!(error = %e, "recursive resolution fell back to forwarding");
-                    if !config.upstream.servers.is_empty() {
-                        let resp = forward_query(request, &config.upstream.servers).await?;
-                        (resp, ResolutionMethod::Forwarding)
-                    } else {
-                        return Err(e.into());
-                    }
+                    tracing::warn!(error = %e, domain = %domain, "recursive resolution failed");
+                    return Err(e.into());
                 }
             }
         }

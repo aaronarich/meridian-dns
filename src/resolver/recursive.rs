@@ -146,7 +146,14 @@ pub async fn resolve(request: &Message) -> Result<Message, RecursiveError> {
 }
 
 /// Resolve a specific name by walking from root servers down
-async fn resolve_name(
+fn resolve_name(
+    name: &Name,
+    record_type: RecordType,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Message, RecursiveError>> + Send + '_>> {
+    Box::pin(resolve_name_inner(name, record_type))
+}
+
+async fn resolve_name_inner(
     name: &Name,
     record_type: RecordType,
 ) -> Result<Message, RecursiveError> {
@@ -219,19 +226,22 @@ async fn resolve_name(
             return Ok(response);
         }
 
-        // Resolve the first NS name we can
+        // Resolve NS names by recursing from root (not from current zone nameservers,
+        // which likely don't know the NS address)
         let mut resolved_any = false;
         for ns_name in ns_names.iter().take(3) {
-            debug!(ns = %ns_name, "resolving nameserver address");
-            // Use current nameservers to resolve the NS name
-            if let Ok(ns_response) =
-                query_nameservers(ns_name, RecordType::A, &nameservers).await
-            {
-                for answer in ns_response.answers() {
-                    if let RData::A(addr) = answer.data() {
-                        next_nameservers.push(SocketAddr::new(addr.0.into(), 53));
-                        resolved_any = true;
+            debug!(ns = %ns_name, "resolving glueless nameserver address from root");
+            match resolve_name(ns_name, RecordType::A).await {
+                Ok(ns_response) => {
+                    for answer in ns_response.answers() {
+                        if let RData::A(addr) = answer.data() {
+                            next_nameservers.push(SocketAddr::new(addr.0.into(), 53));
+                            resolved_any = true;
+                        }
                     }
+                }
+                Err(e) => {
+                    debug!(ns = %ns_name, error = %e, "failed to resolve nameserver address");
                 }
             }
             if resolved_any {
