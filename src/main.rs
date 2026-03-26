@@ -18,7 +18,7 @@ use tracing::{error, info};
 #[command(name = "meridian", about = "A privacy-focused DNS recursive resolver")]
 struct Cli {
     /// Path to config file
-    #[arg(short, long, default_value = "meridian.toml")]
+    #[arg(short, long, default_value = "/etc/meridian/meridian.toml")]
     config: PathBuf,
 
     #[command(subcommand)]

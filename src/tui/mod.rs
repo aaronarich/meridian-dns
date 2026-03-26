@@ -17,35 +17,71 @@ use dashboard::DashboardState;
 
 /// Run the TUI connected to the metrics HTTP endpoint
 pub fn run_remote(metrics_url: &str, tui_config: &TuiConfig) -> Result<(), io::Error> {
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
     let mut terminal = setup_terminal()?;
     let tick_rate = Duration::from_millis(tui_config.tick_rate_ms);
     let url = metrics_url.to_string();
 
-    // We need a runtime for the HTTP client
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    // Shared state between fetcher thread and render loop
+    let shared: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let shared_writer = shared.clone();
+    let fetch_url = url.clone();
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let running_flag = running.clone();
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-    let mut last_state: Option<DashboardState> = None;
-    let mut error_msg: Option<String> = None;
-
-    loop {
-        // Fetch metrics
-        match client.get(&url).send() {
-            Ok(resp) => {
+    // Background thread fetches metrics every second
+    let fetcher = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .ok();
+        let client = match client {
+            Some(c) => c,
+            None => return,
+        };
+        while running_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Ok(resp) = client.get(&fetch_url).send() {
                 if let Ok(body) = resp.text() {
-                    if let Some(state) = DashboardState::from_json(&body) {
-                        error_msg = None;
-                        last_state = Some(state);
+                    if let Ok(mut lock) = shared_writer.lock() {
+                        *lock = Some(body);
                     }
                 }
             }
-            Err(e) => {
-                error_msg = Some(format!("Cannot connect to resolver: {e}"));
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
+
+    let mut last_state: Option<DashboardState> = None;
+    let mut qps_history: Vec<u64> = Vec::new();
+    let mut last_total_queries: Option<u64> = None;
+    let mut last_sample = Instant::now();
+
+    loop {
+        // Check for new metrics data (non-blocking)
+        if let Ok(mut lock) = shared.try_lock() {
+            if let Some(body) = lock.take() {
+                if let Some(mut state) = DashboardState::from_json(&body) {
+                    // Build QPS history from delta between fetches
+                    let now = Instant::now();
+                    let elapsed = now.duration_since(last_sample).as_secs_f64();
+                    if let Some(prev) = last_total_queries {
+                        if elapsed > 0.0 {
+                            let delta = state.total_queries.saturating_sub(prev);
+                            let qps = (delta as f64 / elapsed).round() as u64;
+                            qps_history.push(qps);
+                            if qps_history.len() > 60 {
+                                qps_history.remove(0);
+                            }
+                        }
+                    }
+                    last_total_queries = Some(state.total_queries);
+                    last_sample = now;
+
+                    state.qps_history = qps_history.clone();
+                    last_state = Some(state);
+                }
             }
         }
 
@@ -53,12 +89,10 @@ pub fn run_remote(metrics_url: &str, tui_config: &TuiConfig) -> Result<(), io::E
         if let Some(ref state) = last_state {
             terminal.draw(|frame| dashboard::render(frame, state))?;
         } else {
-            // Show connection error
-            let msg = error_msg.as_deref().unwrap_or("Connecting to resolver...");
             terminal.draw(|frame| {
                 let area = frame.area();
                 let block = ratatui::widgets::Paragraph::new(format!(
-                    "\n  Meridian TUI\n\n  {msg}\n\n  Metrics endpoint: {url}\n\n  Press q to quit"
+                    "\n  Meridian TUI\n\n  Connecting to resolver...\n\n  Metrics endpoint: {url}\n\n  Press q to quit"
                 ))
                 .block(
                     ratatui::widgets::Block::default()
@@ -78,7 +112,8 @@ pub fn run_remote(metrics_url: &str, tui_config: &TuiConfig) -> Result<(), io::E
         }
     }
 
-    let _ = rt; // keep runtime alive
+    running.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = fetcher.join();
     restore_terminal(&mut terminal)?;
     Ok(())
 }
