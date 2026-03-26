@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::net::SocketAddr;
 use std::path::Path;
 use thiserror::Error;
 
@@ -20,6 +21,8 @@ pub enum ResolverMode {
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub mode: ResolverMode,
+    #[serde(default = "default_listen_addr")]
+    pub listen: SocketAddr,
     #[serde(default)]
     pub cache: CacheConfig,
     #[serde(default)]
@@ -44,6 +47,10 @@ impl Default for CacheConfig {
             max_entries: default_max_entries(),
         }
     }
+}
+
+fn default_listen_addr() -> SocketAddr {
+    "0.0.0.0:53".parse().unwrap()
 }
 
 fn default_max_entries() -> usize {

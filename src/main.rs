@@ -1,10 +1,11 @@
-mod config;
-mod listener;
-mod resolver;
-mod cache;
 mod blocklist;
+mod cache;
+mod config;
 mod dnssec;
+mod listener;
 mod metrics;
+mod resolver;
+mod stats;
 mod tui;
 
 use clap::{Parser, Subcommand};
@@ -60,8 +61,14 @@ async fn main() {
             println!("TUI not yet implemented");
         }
         None => {
-            info!(mode = ?config.mode, "starting meridian DNS resolver");
-            println!("Resolver not yet implemented");
+            info!(mode = ?config.mode, listen = %config.listen, "starting meridian DNS resolver");
+
+            let shared_stats = stats::new_shared_stats();
+
+            if let Err(e) = listener::start(config.listen, shared_stats).await {
+                error!("listener error: {e}");
+                std::process::exit(1);
+            }
         }
     }
 }
