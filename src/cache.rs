@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use hickory_proto::op::Message;
-use hickory_proto::rr::RecordType;
+use hickory_proto::rr::{RData, RecordType};
 
 /// Cache key: lowercased domain name + record type
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -49,19 +49,37 @@ impl DnsCache {
     }
 
     /// Store a DNS response in the cache.
-    /// Extracts TTL from the answer records; skips caching if no answers or TTL is 0.
-    pub fn insert(&mut self, key: CacheKey, response: &Message) {
+    /// Extracts TTL from answer records, or from SOA in the authority section
+    /// for negative responses (NXDOMAIN/NODATA). Skips caching if TTL is 0.
+    pub fn insert(&mut self, key: CacheKey, response: &Message, min_ttl_floor: u32) {
         // Find the minimum TTL from answer records
         let min_ttl = response
             .answers()
             .iter()
             .map(|r| r.ttl())
             .min()
+            .or_else(|| {
+                // For negative responses, use the SOA minimum TTL from the authority section
+                response
+                    .name_servers()
+                    .iter()
+                    .filter_map(|r| {
+                        if let RData::SOA(soa) = r.data() {
+                            // RFC 2308: use the minimum of the SOA TTL and the SOA MINIMUM field
+                            Some(r.ttl().min(soa.minimum()))
+                        } else {
+                            None
+                        }
+                    })
+                    .min()
+            })
             .unwrap_or(0);
 
         if min_ttl == 0 {
             return; // Don't cache zero-TTL responses
         }
+
+        let effective_ttl = min_ttl.max(min_ttl_floor);
 
         // Evict expired entries if we're at capacity
         if self.entries.len() >= self.max_entries {
@@ -83,7 +101,7 @@ impl DnsCache {
             CacheEntry {
                 response: serialized,
                 inserted_at: Instant::now(),
-                ttl: Duration::from_secs(min_ttl as u64),
+                ttl: Duration::from_secs(effective_ttl as u64),
             },
         );
     }
@@ -165,7 +183,7 @@ mod tests {
         let response = make_response("example.com.", Ipv4Addr::new(1, 2, 3, 4), 300);
         let k = key("example.com.");
 
-        cache.insert(k.clone(), &response);
+        cache.insert(k.clone(), &response, 0);
         assert_eq!(cache.len(), 1);
 
         let result = cache.lookup(&k);
@@ -180,7 +198,7 @@ mod tests {
     fn zero_ttl_not_cached() {
         let mut cache = DnsCache::new(100);
         let response = make_response("example.com.", Ipv4Addr::new(1, 2, 3, 4), 0);
-        cache.insert(key("example.com."), &response);
+        cache.insert(key("example.com."), &response, 0);
         assert_eq!(cache.len(), 0);
     }
 
@@ -198,12 +216,12 @@ mod tests {
         let r2 = make_response("two.com.", Ipv4Addr::new(2, 2, 2, 2), 200);
         let r3 = make_response("three.com.", Ipv4Addr::new(3, 3, 3, 3), 300);
 
-        cache.insert(key("one.com."), &r1);
-        cache.insert(key("two.com."), &r2);
+        cache.insert(key("one.com."), &r1, 0);
+        cache.insert(key("two.com."), &r2, 0);
         assert_eq!(cache.len(), 2);
 
         // This should evict the entry with the lowest remaining TTL (one.com, 100s)
-        cache.insert(key("three.com."), &r3);
+        cache.insert(key("three.com."), &r3, 0);
         assert_eq!(cache.len(), 2);
         assert!(cache.lookup(&key("one.com.")).is_none());
         assert!(cache.lookup(&key("three.com.")).is_some());
@@ -216,7 +234,7 @@ mod tests {
         let response = make_response("test.com.", Ipv4Addr::new(1, 2, 3, 4), 60);
         {
             let mut c = cache.write().unwrap();
-            c.insert(key("test.com."), &response);
+            c.insert(key("test.com."), &response, 0);
         }
         {
             let mut c = cache.write().unwrap();

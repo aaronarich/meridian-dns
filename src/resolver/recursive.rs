@@ -7,6 +7,9 @@ use hickory_proto::serialize::binary::BinDecodable;
 use tokio::net::UdpSocket;
 use tracing::{debug, warn};
 
+use crate::cache::{CacheKey, SharedCache};
+use crate::config::CacheConfig;
+
 const MAX_RECURSION_DEPTH: usize = 20;
 const MAX_CNAME_CHAIN: usize = 10;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -44,7 +47,11 @@ pub enum RecursiveError {
 }
 
 /// Recursively resolve a DNS query starting from root servers
-pub async fn resolve(request: &Message) -> Result<Message, RecursiveError> {
+pub async fn resolve(
+    request: &Message,
+    cache: &SharedCache,
+    cache_config: &CacheConfig,
+) -> Result<Message, RecursiveError> {
     let query = request
         .queries()
         .first()
@@ -59,7 +66,7 @@ pub async fn resolve(request: &Message) -> Result<Message, RecursiveError> {
     let mut accumulated_cnames: Vec<hickory_proto::rr::Record> = Vec::new();
 
     loop {
-        let result = resolve_name(&current_name, record_type).await?;
+        let result = resolve_name(&current_name, record_type, cache, cache_config).await?;
 
         // Check if we got actual answers for the requested type
         let has_target_answers = result
@@ -145,18 +152,69 @@ pub async fn resolve(request: &Message) -> Result<Message, RecursiveError> {
     }
 }
 
-/// Resolve a specific name by walking from root servers down
-fn resolve_name(
-    name: &Name,
-    record_type: RecordType,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Message, RecursiveError>> + Send + '_>> {
-    Box::pin(resolve_name_inner(name, record_type))
+/// Try to look up a record from the shared cache.
+/// Returns the deserialized Message if found and not expired.
+fn cache_lookup(cache: &SharedCache, name: &Name, record_type: RecordType) -> Option<Message> {
+    let key = CacheKey {
+        name: name.to_string().to_lowercase(),
+        record_type,
+    };
+    let (bytes, _remaining) = cache.write().ok()?.lookup(&key)?;
+    Message::from_bytes(&bytes).ok()
 }
 
-async fn resolve_name_inner(
+/// Store a response in the shared cache, keyed by name + record type.
+fn cache_store(cache: &SharedCache, name: &Name, record_type: RecordType, response: &Message, min_ttl: u32) {
+    let key = CacheKey {
+        name: name.to_string().to_lowercase(),
+        record_type,
+    };
+    if let Ok(mut c) = cache.write() {
+        c.insert(key, response, min_ttl);
+    }
+}
+
+/// Cache all useful records from a referral response (NS records, glue A/AAAA records)
+fn cache_referral(cache: &SharedCache, response: &Message, min_ttl: u32) {
+    // Cache glue A records from the additional section
+    for additional in response.additionals() {
+        let rtype = additional.record_type();
+        if rtype == RecordType::A || rtype == RecordType::AAAA {
+            // Build a minimal response message for this glue record
+            let mut glue_msg = Message::new();
+            glue_msg.set_message_type(MessageType::Response);
+            glue_msg.set_response_code(ResponseCode::NoError);
+            glue_msg.add_answer(additional.clone());
+
+            let key = CacheKey {
+                name: additional.name().to_string().to_lowercase(),
+                record_type: rtype,
+            };
+            if let Ok(mut c) = cache.write() {
+                c.insert(key, &glue_msg, min_ttl);
+            }
+        }
+    }
+}
+
+/// Resolve a specific name by walking from root servers down, using the cache
+/// for intermediate NS/glue lookups.
+async fn resolve_name(
     name: &Name,
     record_type: RecordType,
+    cache: &SharedCache,
+    cache_config: &CacheConfig,
 ) -> Result<Message, RecursiveError> {
+    let min_ttl = cache_config.min_ttl;
+
+    // Check if we already have the final answer cached
+    if let Some(cached) = cache_lookup(cache, name, record_type) {
+        if !cached.answers().is_empty() || cached.response_code() == ResponseCode::NXDomain {
+            debug!(name = %name, rtype = ?record_type, "recursive: cache hit for final answer");
+            return Ok(cached);
+        }
+    }
+
     // Start with root servers
     let mut nameservers: Vec<SocketAddr> = ROOT_SERVERS
         .iter()
@@ -173,11 +231,13 @@ async fn resolve_name_inner(
 
         let response = query_nameservers(name, record_type, &nameservers).await?;
 
-        // If we got an authoritative answer or a definitive response, return it
+        // If we got an authoritative answer or a definitive response, cache and return it
         if response.header().authoritative()
             || !response.answers().is_empty()
             || response.response_code() == ResponseCode::NXDomain
         {
+            // Cache the final answer
+            cache_store(cache, name, record_type, &response, min_ttl);
             return Ok(response);
         }
 
@@ -185,6 +245,9 @@ async fn resolve_name_inner(
         if response.name_servers().is_empty() && response.additionals().is_empty() {
             return Ok(response);
         }
+
+        // Cache all glue/NS records from the referral
+        cache_referral(cache, &response, min_ttl);
 
         // Extract NS referral — get IP addresses from the additional section
         let mut next_nameservers: Vec<SocketAddr> = Vec::new();
@@ -226,22 +289,36 @@ async fn resolve_name_inner(
             return Ok(response);
         }
 
-        // Resolve NS names by recursing from root (not from current zone nameservers,
-        // which likely don't know the NS address)
+        // Resolve the NS names — check cache first, then query
         let mut resolved_any = false;
         for ns_name in ns_names.iter().take(3) {
-            debug!(ns = %ns_name, "resolving glueless nameserver address from root");
-            match resolve_name(ns_name, RecordType::A).await {
-                Ok(ns_response) => {
-                    for answer in ns_response.answers() {
-                        if let RData::A(addr) = answer.data() {
-                            next_nameservers.push(SocketAddr::new(addr.0.into(), 53));
-                            resolved_any = true;
-                        }
+            // Check cache for the NS address first
+            if let Some(cached_ns) = cache_lookup(cache, ns_name, RecordType::A) {
+                for answer in cached_ns.answers() {
+                    if let RData::A(addr) = answer.data() {
+                        next_nameservers.push(SocketAddr::new(addr.0.into(), 53));
+                        resolved_any = true;
                     }
                 }
-                Err(e) => {
-                    debug!(ns = %ns_name, error = %e, "failed to resolve nameserver address");
+                if resolved_any {
+                    debug!(ns = %ns_name, "resolved NS address from cache");
+                    break;
+                }
+            }
+
+            // Fall back to querying current nameservers
+            debug!(ns = %ns_name, "resolving nameserver address via network");
+            if let Ok(ns_response) =
+                query_nameservers(ns_name, RecordType::A, &nameservers).await
+            {
+                // Cache the NS address for future use
+                cache_store(cache, ns_name, RecordType::A, &ns_response, min_ttl);
+
+                for answer in ns_response.answers() {
+                    if let RData::A(addr) = answer.data() {
+                        next_nameservers.push(SocketAddr::new(addr.0.into(), 53));
+                        resolved_any = true;
+                    }
                 }
             }
             if resolved_any {

@@ -39,14 +39,22 @@ pub struct Config {
 pub struct CacheConfig {
     #[serde(default = "default_max_entries")]
     pub max_entries: usize,
+    /// Minimum TTL floor in seconds — prevents very low TTLs from defeating the cache
+    #[serde(default = "default_min_ttl")]
+    pub min_ttl: u32,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             max_entries: default_max_entries(),
+            min_ttl: default_min_ttl(),
         }
     }
+}
+
+fn default_min_ttl() -> u32 {
+    30
 }
 
 fn default_listen_addr() -> SocketAddr {

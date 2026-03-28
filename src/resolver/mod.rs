@@ -9,7 +9,7 @@ use hickory_proto::serialize::binary::BinDecodable;
 
 use crate::blocklist::SharedBlocklist;
 use crate::cache::{CacheKey, SharedCache};
-use crate::config::{Config, ResolverMode, UpstreamServer};
+use crate::config::{CacheConfig, Config, ResolverMode, UpstreamServer};
 use crate::dnssec;
 use crate::stats::{DnssecStatus, ResolutionMethod};
 
@@ -73,7 +73,7 @@ pub async fn resolve(
             (resp, ResolutionMethod::Forwarding)
         }
         ResolverMode::Recursive => {
-            match recursive::resolve(request).await {
+            match recursive::resolve(request, cache, &config.cache).await {
                 Ok(resp) => (resp, ResolutionMethod::Recursive),
                 Err(e) => {
                     tracing::warn!(error = %e, domain = %domain, "recursive resolution failed");
@@ -99,7 +99,7 @@ pub async fn resolve(
 
     // Cache the response if it has answers or authority records
     if !response.answers().is_empty() || !response.name_servers().is_empty() {
-        cache.write().unwrap().insert(cache_key, &response);
+        cache.write().unwrap().insert(cache_key, &response, config.cache.min_ttl);
     }
 
     Ok(ResolveResult {
