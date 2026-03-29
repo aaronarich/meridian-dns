@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::Path;
 use thiserror::Error;
@@ -11,14 +11,14 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum ResolverMode {
     Recursive,
     Forwarding,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
     pub mode: ResolverMode,
     #[serde(default = "default_listen_addr")]
@@ -35,7 +35,7 @@ pub struct Config {
     pub upstream: UpstreamConfig,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CacheConfig {
     #[serde(default = "default_max_entries")]
     pub max_entries: usize,
@@ -85,7 +85,7 @@ fn default_prefetch_threshold() -> f64 {
     0.1 // prefetch when 10% TTL remains
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct BlocklistConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -113,13 +113,13 @@ fn default_refresh_interval() -> u64 {
     24
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct BlocklistSource {
     pub name: String,
     pub url: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct MetricsConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -140,7 +140,7 @@ fn default_metrics_port() -> u16 {
     9053
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct TuiConfig {
     #[serde(default = "default_tick_rate")]
     pub tick_rate_ms: u64,
@@ -158,7 +158,7 @@ fn default_tick_rate() -> u64 {
     250
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UpstreamConfig {
     #[serde(default)]
     pub servers: Vec<UpstreamServer>,
@@ -172,7 +172,7 @@ impl Default for UpstreamConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum UpstreamProtocol {
     Dot,
@@ -180,7 +180,7 @@ pub enum UpstreamProtocol {
     Doq,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UpstreamServer {
     pub name: String,
     pub address: String,
@@ -192,6 +192,13 @@ impl Config {
         let contents = std::fs::read_to_string(path)?;
         let config: Config = toml::from_str(&contents)?;
         Ok(config)
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        let contents = toml::to_string_pretty(self)
+            .map_err(|e| ConfigError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        std::fs::write(path, contents)?;
+        Ok(())
     }
 }
 

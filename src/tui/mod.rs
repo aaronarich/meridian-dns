@@ -15,6 +15,24 @@ use crate::config::{ResolverMode, TuiConfig};
 use crate::stats::SharedStats;
 use dashboard::DashboardState;
 
+/// Input mode for the TUI
+enum InputMode {
+    /// Normal dashboard view
+    Normal,
+    /// Typing a name for a new blocklist source
+    AddName(String),
+    /// Typing a URL for a new blocklist source (name already captured)
+    AddUrl { name: String, url: String },
+    /// Selecting a blocklist source to delete (shows numbered list)
+    Delete,
+}
+
+/// Status message shown temporarily in the footer
+struct StatusMessage {
+    text: String,
+    expires: std::time::Instant,
+}
+
 /// Run the TUI connected to the metrics HTTP endpoint
 pub fn run_remote(metrics_url: &str, tui_config: &TuiConfig) -> Result<(), io::Error> {
     use std::sync::{Arc, Mutex};
@@ -53,10 +71,18 @@ pub fn run_remote(metrics_url: &str, tui_config: &TuiConfig) -> Result<(), io::E
         }
     });
 
+    // HTTP client for POST requests (blocklist management)
+    let post_client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok();
+
     let mut last_state: Option<DashboardState> = None;
     let mut qps_history: Vec<u64> = Vec::new();
     let mut last_total_queries: Option<u64> = None;
     let mut last_sample = Instant::now();
+    let mut input_mode = InputMode::Normal;
+    let mut status_msg: Option<StatusMessage> = None;
 
     loop {
         // Check for new metrics data (non-blocking)
@@ -85,9 +111,51 @@ pub fn run_remote(metrics_url: &str, tui_config: &TuiConfig) -> Result<(), io::E
             }
         }
 
+        // Clear expired status messages
+        if let Some(ref msg) = status_msg {
+            if std::time::Instant::now() > msg.expires {
+                status_msg = None;
+            }
+        }
+
+        // Build overlay info for rendering
+        let input_overlay = match &input_mode {
+            InputMode::Normal => None,
+            InputMode::AddName(name) => {
+                Some(format!("Add blocklist — Name: {name}█  (Enter to confirm, Esc to cancel)"))
+            }
+            InputMode::AddUrl { name, url } => {
+                Some(format!("Add blocklist \"{name}\" — URL: {url}█  (Enter to confirm, Esc to cancel)"))
+            }
+            InputMode::Delete => {
+                let sources = last_state
+                    .as_ref()
+                    .map(|s| &s.config.blocklist_sources)
+                    .cloned()
+                    .unwrap_or_default();
+                if sources.is_empty() {
+                    Some("No blocklist sources to remove. (Esc to go back)".to_string())
+                } else {
+                    let list: Vec<String> = sources
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| format!("  {}. {} ({})", i + 1, s.name, s.url))
+                        .collect();
+                    Some(format!(
+                        "Remove blocklist — press number to delete:\n{}\n  (Esc to cancel)",
+                        list.join("\n")
+                    ))
+                }
+            }
+        };
+
+        let status_text = status_msg.as_ref().map(|m| m.text.clone());
+
         // Render
         if let Some(ref state) = last_state {
-            terminal.draw(|frame| dashboard::render(frame, state))?;
+            terminal.draw(|frame| {
+                dashboard::render_with_overlay(frame, state, input_overlay.as_deref(), status_text.as_deref())
+            })?;
         } else {
             terminal.draw(|frame| {
                 let area = frame.area();
@@ -105,8 +173,155 @@ pub fn run_remote(metrics_url: &str, tui_config: &TuiConfig) -> Result<(), io::E
 
         if event::poll(tick_rate)? {
             if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press && key.code == KeyCode::Char('q') {
-                    break;
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+
+                match &mut input_mode {
+                    InputMode::Normal => match key.code {
+                        KeyCode::Char('q') => break,
+                        KeyCode::Char('r') => {
+                            // Trigger blocklist refresh
+                            if let Some(ref client) = post_client {
+                                let refresh_url = format!("{}blocklist/refresh", url);
+                                match client.post(&refresh_url).send() {
+                                    Ok(_) => {
+                                        status_msg = Some(StatusMessage {
+                                            text: "Blocklist refresh triggered".to_string(),
+                                            expires: std::time::Instant::now() + Duration::from_secs(3),
+                                        });
+                                    }
+                                    Err(e) => {
+                                        status_msg = Some(StatusMessage {
+                                            text: format!("Refresh failed: {e}"),
+                                            expires: std::time::Instant::now() + Duration::from_secs(5),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Char('a') => {
+                            input_mode = InputMode::AddName(String::new());
+                        }
+                        KeyCode::Char('d') => {
+                            input_mode = InputMode::Delete;
+                        }
+                        _ => {}
+                    },
+                    InputMode::AddName(name) => match key.code {
+                        KeyCode::Char(c) => name.push(c),
+                        KeyCode::Backspace => { name.pop(); }
+                        KeyCode::Enter => {
+                            if !name.is_empty() {
+                                let captured_name = name.clone();
+                                input_mode = InputMode::AddUrl {
+                                    name: captured_name,
+                                    url: String::new(),
+                                };
+                            }
+                        }
+                        KeyCode::Esc => {
+                            input_mode = InputMode::Normal;
+                        }
+                        _ => {}
+                    },
+                    InputMode::AddUrl { name, url: input_url } => match key.code {
+                        KeyCode::Char(c) => input_url.push(c),
+                        KeyCode::Backspace => { input_url.pop(); }
+                        KeyCode::Enter => {
+                            if !input_url.is_empty() {
+                                if let Some(ref client) = post_client {
+                                    let add_url = format!("{}blocklist/add", url);
+                                    let body = format!(
+                                        r#"{{"name":"{}","url":"{}"}}"#,
+                                        name.replace('"', "\\\""),
+                                        input_url.replace('"', "\\\""),
+                                    );
+                                    let result = client.post(&add_url)
+                                        .header("Content-Type", "application/json")
+                                        .body(body)
+                                        .send();
+                                    match result {
+                                        Ok(resp) => {
+                                            if resp.status().is_success() {
+                                                status_msg = Some(StatusMessage {
+                                                    text: format!("Added blocklist \"{}\"", name),
+                                                    expires: std::time::Instant::now() + Duration::from_secs(3),
+                                                });
+                                            } else {
+                                                let err = resp.text().unwrap_or_default();
+                                                status_msg = Some(StatusMessage {
+                                                    text: format!("Failed to add: {err}"),
+                                                    expires: std::time::Instant::now() + Duration::from_secs(5),
+                                                });
+                                            }
+                                        }
+                                        Err(e) => {
+                                            status_msg = Some(StatusMessage {
+                                                text: format!("Error: {e}"),
+                                                expires: std::time::Instant::now() + Duration::from_secs(5),
+                                            });
+                                        }
+                                    }
+                                }
+                                input_mode = InputMode::Normal;
+                            }
+                        }
+                        KeyCode::Esc => {
+                            input_mode = InputMode::Normal;
+                        }
+                        _ => {}
+                    },
+                    InputMode::Delete => match key.code {
+                        KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                            let idx = (c as u8 - b'1') as usize;
+                            let sources = last_state
+                                .as_ref()
+                                .map(|s| &s.config.blocklist_sources)
+                                .cloned()
+                                .unwrap_or_default();
+                            if let Some(source) = sources.get(idx) {
+                                if let Some(ref client) = post_client {
+                                    let remove_url = format!("{}blocklist/remove", url);
+                                    let body = format!(
+                                        r#"{{"name":"{}"}}"#,
+                                        source.name.replace('"', "\\\""),
+                                    );
+                                    let result = client.post(&remove_url)
+                                        .header("Content-Type", "application/json")
+                                        .body(body)
+                                        .send();
+                                    match result {
+                                        Ok(resp) => {
+                                            if resp.status().is_success() {
+                                                status_msg = Some(StatusMessage {
+                                                    text: format!("Removed blocklist \"{}\"", source.name),
+                                                    expires: std::time::Instant::now() + Duration::from_secs(3),
+                                                });
+                                            } else {
+                                                let err = resp.text().unwrap_or_default();
+                                                status_msg = Some(StatusMessage {
+                                                    text: format!("Failed to remove: {err}"),
+                                                    expires: std::time::Instant::now() + Duration::from_secs(5),
+                                                });
+                                            }
+                                        }
+                                        Err(e) => {
+                                            status_msg = Some(StatusMessage {
+                                                text: format!("Error: {e}"),
+                                                expires: std::time::Instant::now() + Duration::from_secs(5),
+                                            });
+                                        }
+                                    }
+                                }
+                                input_mode = InputMode::Normal;
+                            }
+                        }
+                        KeyCode::Esc => {
+                            input_mode = InputMode::Normal;
+                        }
+                        _ => {}
+                    },
                 }
             }
         }

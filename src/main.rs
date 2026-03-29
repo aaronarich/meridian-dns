@@ -103,8 +103,9 @@ async fn main() {
                 let metrics_blocklist = shared_blocklist.clone();
                 let metrics_port = config.metrics.port;
                 let metrics_config = config.clone();
+                let metrics_config_path = cli.config.clone();
                 tokio::spawn(async move {
-                    metrics::start(metrics_port, metrics_stats, metrics_blocklist, metrics_config).await;
+                    metrics::start(metrics_port, metrics_stats, metrics_blocklist, metrics_config, metrics_config_path).await;
                 });
             }
 

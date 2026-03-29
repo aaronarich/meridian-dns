@@ -37,6 +37,7 @@ pub struct ConfigInfo {
     pub upstreams: Vec<UpstreamInfo>,
 }
 
+#[derive(Clone)]
 pub struct BlocklistSourceInfo {
     pub name: String,
     pub url: String,
@@ -559,19 +560,86 @@ fn render_config(frame: &mut Frame, area: Rect, state: &DashboardState) {
     frame.render_widget(blocklists, chunks[1]);
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, state: &DashboardState) {
-    let _ = state;
+fn render_footer(frame: &mut Frame, area: Rect, _state: &DashboardState) {
     let footer = Paragraph::new(Line::from(vec![
         Span::styled("  q", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         Span::styled(" quit  ", Style::default().fg(Color::DarkGray)),
         Span::styled("r", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled(" refresh blocklist  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("↑↓", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled(" scroll log", Style::default().fg(Color::DarkGray)),
+        Span::styled(" refresh  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("a", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(" add blocklist  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("d", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(" remove blocklist", Style::default().fg(Color::DarkGray)),
     ]))
     .wrap(Wrap { trim: false })
     .block(Block::default().borders(Borders::ALL).title(" Keys "));
     frame.render_widget(footer, area);
+}
+
+/// Render the dashboard with an optional input overlay in the footer area
+pub fn render_with_overlay(
+    frame: &mut Frame,
+    state: &DashboardState,
+    overlay: Option<&str>,
+    status: Option<&str>,
+) {
+    let size = frame.area();
+
+    // Determine footer height based on overlay content
+    let footer_height = if let Some(text) = overlay {
+        // Count lines in overlay + borders
+        (text.lines().count() as u16 + 2).max(3)
+    } else {
+        3
+    };
+
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),           // header
+            Constraint::Min(10),            // middle
+            Constraint::Length(8),          // config
+            Constraint::Length(footer_height), // footer / overlay
+        ])
+        .split(size);
+
+    render_header(frame, outer[0], state);
+    render_middle(frame, outer[1], state);
+    render_config(frame, outer[2], state);
+
+    if let Some(text) = overlay {
+        // Render input overlay instead of normal footer
+        let overlay_widget = Paragraph::new(text)
+            .style(Style::default().fg(Color::White))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Input ")
+                    .style(Style::default().fg(Color::Yellow)),
+            );
+        frame.render_widget(overlay_widget, outer[3]);
+    } else if let Some(status_text) = status {
+        // Render status message in footer
+        let footer = Paragraph::new(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(status_text, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled("  |  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("q", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(" quit  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("r", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(" refresh  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("a", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(" add  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("d", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(" remove", Style::default().fg(Color::DarkGray)),
+        ]))
+        .wrap(Wrap { trim: false })
+        .block(Block::default().borders(Borders::ALL).title(" Keys "));
+        frame.render_widget(footer, outer[3]);
+    } else {
+        render_footer(frame, outer[3], state);
+    }
 }
 
 fn format_number(n: u64) -> String {
