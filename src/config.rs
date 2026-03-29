@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::Path;
 use thiserror::Error;
@@ -11,14 +11,14 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum ResolverMode {
     Recursive,
     Forwarding,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
     pub mode: ResolverMode,
     #[serde(default = "default_listen_addr")]
@@ -35,26 +35,34 @@ pub struct Config {
     pub upstream: UpstreamConfig,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CacheConfig {
     #[serde(default = "default_max_entries")]
     pub max_entries: usize,
-    /// Minimum TTL floor in seconds — prevents very low TTLs from defeating the cache
+    /// Minimum TTL floor in seconds — short upstream TTLs are raised to this value
     #[serde(default = "default_min_ttl")]
-    pub min_ttl: u32,
+    pub min_ttl_secs: u64,
+    /// TTL for negative cache entries (NXDOMAIN / SERVFAIL), 0 to disable
+    #[serde(default = "default_negative_ttl")]
+    pub negative_ttl_secs: u64,
+    /// Enable background prefetching of entries nearing expiry
+    #[serde(default)]
+    pub prefetch: bool,
+    /// Prefetch when remaining TTL falls below this fraction of original TTL (0.0–1.0)
+    #[serde(default = "default_prefetch_threshold")]
+    pub prefetch_threshold: f64,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             max_entries: default_max_entries(),
-            min_ttl: default_min_ttl(),
+            min_ttl_secs: default_min_ttl(),
+            negative_ttl_secs: default_negative_ttl(),
+            prefetch: false,
+            prefetch_threshold: default_prefetch_threshold(),
         }
     }
-}
-
-fn default_min_ttl() -> u32 {
-    30
 }
 
 fn default_listen_addr() -> SocketAddr {
@@ -65,7 +73,19 @@ fn default_max_entries() -> usize {
     10_000
 }
 
-#[derive(Debug, Deserialize, Clone)]
+fn default_min_ttl() -> u64 {
+    300 // 5 minutes
+}
+
+fn default_negative_ttl() -> u64 {
+    300 // 5 minutes
+}
+
+fn default_prefetch_threshold() -> f64 {
+    0.1 // prefetch when 10% TTL remains
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct BlocklistConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -93,13 +113,13 @@ fn default_refresh_interval() -> u64 {
     24
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct BlocklistSource {
     pub name: String,
     pub url: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct MetricsConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -120,7 +140,7 @@ fn default_metrics_port() -> u16 {
     9053
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct TuiConfig {
     #[serde(default = "default_tick_rate")]
     pub tick_rate_ms: u64,
@@ -138,7 +158,7 @@ fn default_tick_rate() -> u64 {
     250
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UpstreamConfig {
     #[serde(default)]
     pub servers: Vec<UpstreamServer>,
@@ -152,7 +172,7 @@ impl Default for UpstreamConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum UpstreamProtocol {
     Dot,
@@ -160,7 +180,7 @@ pub enum UpstreamProtocol {
     Doq,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UpstreamServer {
     pub name: String,
     pub address: String,
@@ -172,6 +192,13 @@ impl Config {
         let contents = std::fs::read_to_string(path)?;
         let config: Config = toml::from_str(&contents)?;
         Ok(config)
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        let contents = toml::to_string_pretty(self)
+            .map_err(|e| ConfigError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        std::fs::write(path, contents)?;
+        Ok(())
     }
 }
 
@@ -186,6 +213,10 @@ mode = "recursive"
 
 [cache]
 max_entries = 5000
+min_ttl_secs = 600
+negative_ttl_secs = 120
+prefetch = true
+prefetch_threshold = 0.2
 
 [blocklist]
 enabled = true
@@ -215,6 +246,10 @@ protocol = "doq"
         let config: Config = toml::from_str(toml_str).unwrap();
         assert!(matches!(config.mode, ResolverMode::Recursive));
         assert_eq!(config.cache.max_entries, 5000);
+        assert_eq!(config.cache.min_ttl_secs, 600);
+        assert_eq!(config.cache.negative_ttl_secs, 120);
+        assert!(config.cache.prefetch);
+        assert!((config.cache.prefetch_threshold - 0.2).abs() < f64::EPSILON);
         assert_eq!(config.blocklist.sources.len(), 1);
         assert_eq!(config.upstream.servers.len(), 2);
     }
@@ -225,6 +260,9 @@ protocol = "doq"
         let config: Config = toml::from_str(toml_str).unwrap();
         assert!(matches!(config.mode, ResolverMode::Forwarding));
         assert_eq!(config.cache.max_entries, 10_000);
+        assert_eq!(config.cache.min_ttl_secs, 300); // default
+        assert_eq!(config.cache.negative_ttl_secs, 300); // default
+        assert!(!config.cache.prefetch); // default off
         assert!(config.blocklist.enabled);
     }
 

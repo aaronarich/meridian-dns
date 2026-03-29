@@ -80,7 +80,13 @@ async fn main() {
             info!(mode = ?config.mode, listen = %config.listen, "starting meridian DNS resolver");
 
             let shared_stats = stats::new_shared_stats();
-            let shared_cache = cache::new_shared_cache(config.cache.max_entries);
+            let shared_cache = cache::new_shared_cache(
+                config.cache.max_entries,
+                config.cache.min_ttl_secs,
+                config.cache.negative_ttl_secs,
+                config.cache.prefetch,
+                config.cache.prefetch_threshold,
+            );
             let shared_blocklist = blocklist::new_shared_blocklist();
 
             // Load blocklists on startup
@@ -97,8 +103,9 @@ async fn main() {
                 let metrics_blocklist = shared_blocklist.clone();
                 let metrics_port = config.metrics.port;
                 let metrics_config = config.clone();
+                let metrics_config_path = cli.config.clone();
                 tokio::spawn(async move {
-                    metrics::start(metrics_port, metrics_stats, metrics_blocklist, metrics_config).await;
+                    metrics::start(metrics_port, metrics_stats, metrics_blocklist, metrics_config, metrics_config_path).await;
                 });
             }
 

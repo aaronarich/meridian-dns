@@ -2,6 +2,7 @@ pub mod forwarding;
 pub mod recursive;
 
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::{RData, Record, RecordType};
@@ -23,7 +24,7 @@ pub struct ResolveResult {
 /// Try to resolve a query: check blocklist, then cache, then forward/recurse
 pub async fn resolve(
     request: &Message,
-    config: &Config,
+    config: &Arc<Config>,
     cache: &SharedCache,
     blocklist: &SharedBlocklist,
 ) -> Result<ResolveResult, Box<dyn std::error::Error + Send + Sync>> {
@@ -55,9 +56,15 @@ pub async fn resolve(
     };
 
     // Check cache
-    if let Some((cached_bytes, _remaining_ttl)) = cache.write().unwrap().lookup(&cache_key) {
-        if let Ok(mut cached_msg) = Message::from_bytes(&cached_bytes) {
+    if let Some(lookup) = cache.write().unwrap().lookup(&cache_key) {
+        if let Ok(mut cached_msg) = Message::from_bytes(&lookup.bytes) {
             cached_msg.set_id(request.id());
+
+            // Trigger background prefetch if entry is nearing expiry
+            if lookup.needs_prefetch {
+                spawn_prefetch(request.clone(), config.clone(), cache.clone(), blocklist.clone());
+            }
+
             return Ok(ResolveResult {
                 response: cached_msg,
                 method: ResolutionMethod::Cache,
@@ -73,15 +80,29 @@ pub async fn resolve(
             (resp, ResolutionMethod::Forwarding)
         }
         ResolverMode::Recursive => {
-            match recursive::resolve(request, cache, &config.cache).await {
+            match recursive::resolve(request, cache).await {
                 Ok(resp) => (resp, ResolutionMethod::Recursive),
                 Err(e) => {
                     tracing::warn!(error = %e, domain = %domain, "recursive resolution failed");
+                    // Cache the SERVFAIL as a negative entry
+                    let servfail = build_servfail_response(request);
+                    cache.write().unwrap().insert_negative(cache_key, &servfail);
                     return Err(e.into());
                 }
             }
         }
     };
+
+    // Cache negative responses (NXDOMAIN)
+    if response.response_code() == ResponseCode::NXDomain {
+        tracing::debug!(domain = %domain, "caching negative response (NXDOMAIN)");
+        cache.write().unwrap().insert_negative(cache_key, &response);
+        return Ok(ResolveResult {
+            response,
+            method,
+            dnssec: DnssecStatus::Skipped,
+        });
+    }
 
     // Run DNSSEC validation (non-blocking, best-effort)
     let dnssec_result = dnssec::validate(&response, None).await;
@@ -99,7 +120,7 @@ pub async fn resolve(
 
     // Cache the response if it has answers or authority records
     if !response.answers().is_empty() || !response.name_servers().is_empty() {
-        cache.write().unwrap().insert(cache_key, &response, config.cache.min_ttl);
+        cache.write().unwrap().insert(cache_key, &response);
     }
 
     Ok(ResolveResult {
@@ -107,6 +128,56 @@ pub async fn resolve(
         method,
         dnssec: dnssec_status,
     })
+}
+
+/// Spawn a background task to re-resolve and refresh the cache entry
+fn spawn_prefetch(
+    request: Message,
+    config: Arc<Config>,
+    cache: SharedCache,
+    blocklist: SharedBlocklist,
+) {
+    tokio::spawn(async move {
+        let domain = request
+            .queries()
+            .first()
+            .map(|q| q.name().to_string())
+            .unwrap_or_default();
+
+        tracing::debug!(domain = %domain, "prefetching cache entry");
+
+        let query = match request.queries().first() {
+            Some(q) => q,
+            None => return,
+        };
+
+        let cache_key = CacheKey {
+            name: domain.to_lowercase(),
+            record_type: query.query_type(),
+        };
+
+        // Resolve directly (skip cache check)
+        let result = match config.mode {
+            ResolverMode::Forwarding => {
+                forward_query(&request, &config.upstream.servers).await
+            }
+            ResolverMode::Recursive => {
+                recursive::resolve(&request, &cache).await.map_err(|e| e.into())
+            }
+        };
+
+        match result {
+            Ok(response) => {
+                if !response.answers().is_empty() || !response.name_servers().is_empty() {
+                    cache.write().unwrap().insert(cache_key, &response);
+                    tracing::debug!(domain = %domain, "prefetch complete, cache refreshed");
+                }
+            }
+            Err(e) => {
+                tracing::debug!(domain = %domain, error = %e, "prefetch failed");
+            }
+        }
+    });
 }
 
 /// Build a response that returns 0.0.0.0 for blocked domains
@@ -130,6 +201,23 @@ fn build_blocked_response(request: &Message) -> Message {
             );
             response.add_answer(record);
         }
+    }
+
+    response
+}
+
+/// Build a SERVFAIL response (used for negative caching of failed resolutions)
+fn build_servfail_response(request: &Message) -> Message {
+    let mut response = Message::new();
+    response.set_id(request.id());
+    response.set_message_type(MessageType::Response);
+    response.set_op_code(OpCode::Query);
+    response.set_response_code(ResponseCode::ServFail);
+    response.set_recursion_available(true);
+    response.set_recursion_desired(request.recursion_desired());
+
+    for query in request.queries() {
+        response.add_query(query.clone());
     }
 
     response

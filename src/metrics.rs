@@ -1,12 +1,13 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
-use crate::blocklist::SharedBlocklist;
-use crate::config::Config;
+use crate::blocklist::{self, SharedBlocklist};
+use crate::config::{BlocklistSource, Config};
 use crate::stats::SharedStats;
 
 /// Start the metrics HTTP server
@@ -15,6 +16,7 @@ pub async fn start(
     stats: SharedStats,
     blocklist: SharedBlocklist,
     config: Arc<Config>,
+    config_path: PathBuf,
 ) {
     let addr: SocketAddr = ([0, 0, 0, 0], port).into();
 
@@ -41,28 +43,185 @@ pub async fn start(
         let stats = stats.clone();
         let blocklist = blocklist.clone();
         let config = config.clone();
+        let config_path = config_path.clone();
 
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 4096];
-            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let mut buf = vec![0u8; 8192];
+            let n = match stream.read(&mut buf).await {
+                Ok(n) => n,
+                Err(_) => return,
+            };
 
-            let body = build_metrics_json(&stats, &blocklist, &config);
+            let (method, path, body) = parse_http_request(&buf[..n]);
 
-            let response = format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: application/json\r\n\
-                 Content-Length: {}\r\n\
-                 Access-Control-Allow-Origin: *\r\n\
-                 Connection: close\r\n\
-                 \r\n\
-                 {}",
-                body.len(),
-                body
-            );
+            let response = match (method.as_str(), path.as_str()) {
+                ("GET", "/") | ("GET", "") => {
+                    let json = build_metrics_json(&stats, &blocklist, &config);
+                    http_response(200, "application/json", &json)
+                }
+                ("POST", "/blocklist/refresh") => {
+                    handle_blocklist_refresh(&blocklist, &config_path).await
+                }
+                ("POST", "/blocklist/add") => {
+                    handle_blocklist_add(&body, &blocklist, &config_path).await
+                }
+                ("POST", "/blocklist/remove") => {
+                    handle_blocklist_remove(&body, &blocklist, &config_path).await
+                }
+                _ => http_response(404, "application/json", r#"{"error":"not found"}"#),
+            };
 
             let _ = stream.write_all(response.as_bytes()).await;
         });
     }
+}
+
+fn parse_http_request(buf: &[u8]) -> (String, String, String) {
+    let request = String::from_utf8_lossy(buf);
+    let mut lines = request.lines();
+    let first_line = lines.next().unwrap_or("");
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or("GET").to_string();
+    let path = parts.next().unwrap_or("/").to_string();
+
+    // Find body after \r\n\r\n
+    let body = request
+        .find("\r\n\r\n")
+        .map(|i| request[i + 4..].trim_end_matches('\0').to_string())
+        .unwrap_or_default();
+
+    (method, path, body)
+}
+
+fn http_response(status: u16, content_type: &str, body: &str) -> String {
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        _ => "Unknown",
+    };
+    format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Type: {content_type}\r\n\
+         Content-Length: {}\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len()
+    )
+}
+
+async fn handle_blocklist_refresh(
+    blocklist: &SharedBlocklist,
+    config_path: &PathBuf,
+) -> String {
+    let config = match Config::load(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "failed to load config for blocklist refresh");
+            return http_response(500, "application/json", &format!(r#"{{"error":"{}"}}"#, e));
+        }
+    };
+
+    blocklist::load(&config.blocklist, blocklist).await;
+    info!("blocklist refreshed via API");
+    http_response(200, "application/json", r#"{"status":"ok","action":"refresh"}"#)
+}
+
+async fn handle_blocklist_add(
+    body: &str,
+    blocklist: &SharedBlocklist,
+    config_path: &PathBuf,
+) -> String {
+    // Parse JSON body: {"name": "...", "url": "..."}
+    let v: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return http_response(400, "application/json", &format!(r#"{{"error":"invalid JSON: {}"}}"#, e));
+        }
+    };
+
+    let name = match v["name"].as_str() {
+        Some(n) if !n.is_empty() => n.to_string(),
+        _ => return http_response(400, "application/json", r#"{"error":"missing 'name' field"}"#),
+    };
+
+    let url = match v["url"].as_str() {
+        Some(u) if !u.is_empty() => u.to_string(),
+        _ => return http_response(400, "application/json", r#"{"error":"missing 'url' field"}"#),
+    };
+
+    // Load config from disk, modify, save back
+    let mut config = match Config::load(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return http_response(500, "application/json", &format!(r#"{{"error":"{}"}}"#, e));
+        }
+    };
+
+    // Check for duplicate name
+    if config.blocklist.sources.iter().any(|s| s.name == name) {
+        return http_response(400, "application/json", r#"{"error":"source with that name already exists"}"#);
+    }
+
+    config.blocklist.sources.push(BlocklistSource {
+        name: name.clone(),
+        url: url.clone(),
+    });
+
+    if let Err(e) = config.save(config_path) {
+        warn!(error = %e, "failed to save config after adding blocklist source");
+        return http_response(500, "application/json", &format!(r#"{{"error":"{}"}}"#, e));
+    }
+
+    // Reload blocklist with updated config
+    blocklist::load(&config.blocklist, blocklist).await;
+    info!(name = %name, url = %url, "blocklist source added via API");
+    http_response(200, "application/json", r#"{"status":"ok","action":"add"}"#)
+}
+
+async fn handle_blocklist_remove(
+    body: &str,
+    blocklist: &SharedBlocklist,
+    config_path: &PathBuf,
+) -> String {
+    let v: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return http_response(400, "application/json", &format!(r#"{{"error":"invalid JSON: {}"}}"#, e));
+        }
+    };
+
+    let name = match v["name"].as_str() {
+        Some(n) if !n.is_empty() => n.to_string(),
+        _ => return http_response(400, "application/json", r#"{"error":"missing 'name' field"}"#),
+    };
+
+    let mut config = match Config::load(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return http_response(500, "application/json", &format!(r#"{{"error":"{}"}}"#, e));
+        }
+    };
+
+    let before_len = config.blocklist.sources.len();
+    config.blocklist.sources.retain(|s| s.name != name);
+
+    if config.blocklist.sources.len() == before_len {
+        return http_response(404, "application/json", r#"{"error":"source not found"}"#);
+    }
+
+    if let Err(e) = config.save(config_path) {
+        warn!(error = %e, "failed to save config after removing blocklist source");
+        return http_response(500, "application/json", &format!(r#"{{"error":"{}"}}"#, e));
+    }
+
+    // Reload blocklist with updated config
+    blocklist::load(&config.blocklist, blocklist).await;
+    info!(name = %name, "blocklist source removed via API");
+    http_response(200, "application/json", r#"{"status":"ok","action":"remove"}"#)
 }
 
 fn build_metrics_json(
@@ -81,6 +240,19 @@ fn build_metrics_json(
         .and_then(|b| b.last_refresh)
         .map(|t| t.elapsed().as_secs())
         .unwrap_or(0);
+
+    // Build query history (24h in 10-minute buckets)
+    let history: Vec<String> = s
+        .query_history
+        .iter()
+        .map(|b| {
+            let mins_ago = b.window_start.elapsed().as_secs() / 60;
+            format!(
+                r#"{{"mins_ago":{},"cache":{},"recursive":{},"forwarded":{},"blocked":{}}}"#,
+                mins_ago, b.cache, b.recursive, b.forwarded, b.blocked,
+            )
+        })
+        .collect();
 
     let recent: Vec<String> = s
         .recent_queries
@@ -138,7 +310,7 @@ fn build_metrics_json(
         .collect();
 
     format!(
-        r#"{{"uptime_secs":{},"total_queries":{},"cache_hits":{},"cache_hit_rate":{:.1},"blocked_queries":{},"forwarded_queries":{},"recursive_queries":{},"blocklist_domains":{},"blocklist_last_refresh_secs_ago":{},"recent_queries":[{}],"config":{{"mode":"{}","listen":"{}","cache_max_entries":{},"blocklist_enabled":{},"blocklist_refresh_hours":{},"blocklist_sources":[{}],"upstreams":[{}]}}}}"#,
+        r#"{{"uptime_secs":{},"total_queries":{},"cache_hits":{},"cache_hit_rate":{:.1},"blocked_queries":{},"forwarded_queries":{},"recursive_queries":{},"blocklist_domains":{},"blocklist_last_refresh_secs_ago":{},"query_history":[{}],"recent_queries":[{}],"config":{{"mode":"{}","listen":"{}","cache_max_entries":{},"blocklist_enabled":{},"blocklist_refresh_hours":{},"blocklist_sources":[{}],"upstreams":[{}]}}}}"#,
         uptime_secs,
         s.total_queries,
         s.cache_hits,
@@ -148,6 +320,7 @@ fn build_metrics_json(
         s.recursive_queries,
         blocklist_count,
         blocklist_last_refresh,
+        history.join(","),
         recent.join(","),
         mode,
         config.listen,
@@ -222,5 +395,24 @@ protocol = "dot"
         assert!(json.contains("\"total_queries\":1"));
         assert!(json.contains("\"forwarded_queries\":1"));
         assert!(json.contains("example.com"));
+    }
+
+    #[test]
+    fn parse_get_request() {
+        let raw = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let (method, path, body) = parse_http_request(raw);
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/");
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn parse_post_request_with_body() {
+        let raw = b"POST /blocklist/add HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"name\":\"test\",\"url\":\"https://example.com\"}";
+        let (method, path, body) = parse_http_request(raw);
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/blocklist/add");
+        assert!(body.contains("test"));
+        assert!(body.contains("https://example.com"));
     }
 }

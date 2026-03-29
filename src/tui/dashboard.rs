@@ -2,9 +2,11 @@ use std::time::{Duration, Instant};
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
+use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
 use ratatui::widgets::{
-    Bar, BarChart, BarGroup, Block, Borders, Cell, Paragraph, Row, Table, Wrap,
+    Block, Borders, Cell, Paragraph, Row, Table, Wrap,
 };
 use ratatui::Frame;
 
@@ -22,7 +24,7 @@ pub struct DashboardState {
     pub forwarded_queries: u64,
     pub recursive_queries: u64,
     pub recent_queries: Vec<RecentQuery>,
-    pub qps_history: Vec<u64>,
+    pub query_history: Vec<HistoryBucket>,
     pub blocklist_domain_count: usize,
     pub blocklist_last_refresh: String,
     pub config: ConfigInfo,
@@ -37,6 +39,7 @@ pub struct ConfigInfo {
     pub upstreams: Vec<UpstreamInfo>,
 }
 
+#[derive(Clone)]
 pub struct BlocklistSourceInfo {
     pub name: String,
     pub url: String,
@@ -58,6 +61,22 @@ impl Default for ConfigInfo {
             blocklist_sources: Vec::new(),
             upstreams: Vec::new(),
         }
+    }
+}
+
+/// A 10-minute bucket of query history broken down by method
+#[derive(Clone)]
+pub struct HistoryBucket {
+    pub mins_ago: u64,
+    pub cache: u64,
+    pub recursive: u64,
+    pub forwarded: u64,
+    pub blocked: u64,
+}
+
+impl HistoryBucket {
+    pub fn total(&self) -> u64 {
+        self.cache + self.recursive + self.forwarded + self.blocked
     }
 }
 
@@ -89,10 +108,16 @@ impl DashboardState {
             })
             .collect();
 
-        let qps_history: Vec<u64> = s
-            .queries_per_second
+        let query_history: Vec<HistoryBucket> = s
+            .query_history
             .iter()
-            .map(|(_, count)| *count)
+            .map(|b| HistoryBucket {
+                mins_ago: b.window_start.elapsed().as_secs() / 60,
+                cache: b.cache,
+                recursive: b.recursive,
+                forwarded: b.forwarded,
+                blocked: b.blocked,
+            })
             .collect();
 
         Self {
@@ -105,7 +130,7 @@ impl DashboardState {
             forwarded_queries: s.forwarded_queries,
             recursive_queries: s.recursive_queries,
             recent_queries,
-            qps_history,
+            query_history,
             blocklist_domain_count: 0,
             blocklist_last_refresh: "N/A".to_string(),
             config: ConfigInfo::default(),
@@ -142,6 +167,21 @@ impl DashboardState {
         } else {
             ResolverMode::Forwarding
         };
+
+        let query_history: Vec<HistoryBucket> = v["query_history"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|b| HistoryBucket {
+                        mins_ago: b["mins_ago"].as_u64().unwrap_or(0),
+                        cache: b["cache"].as_u64().unwrap_or(0),
+                        recursive: b["recursive"].as_u64().unwrap_or(0),
+                        forwarded: b["forwarded"].as_u64().unwrap_or(0),
+                        blocked: b["blocked"].as_u64().unwrap_or(0),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let recent_queries: Vec<RecentQuery> = v["recent_queries"]
             .as_array()
@@ -209,7 +249,7 @@ impl DashboardState {
             forwarded_queries,
             recursive_queries,
             recent_queries,
-            qps_history: Vec::new(),
+            query_history,
             blocklist_domain_count,
             blocklist_last_refresh,
             config: config_info,
@@ -244,7 +284,13 @@ impl DashboardState {
             forwarded_queries: 1_203,
             recursive_queries: 3_191,
             recent_queries,
-            qps_history: vec![12, 8, 15, 22, 18, 9, 14, 25, 31, 19, 11, 7, 16, 20, 27, 13, 10, 23, 17, 14],
+            query_history: (0..144).rev().map(|i| HistoryBucket {
+                mins_ago: i * 10,
+                cache: (50.0 + 30.0 * (i as f64 * 0.15).sin()) as u64,
+                recursive: (20.0 + 15.0 * (i as f64 * 0.1 + 1.0).sin()) as u64,
+                forwarded: (15.0 + 10.0 * (i as f64 * 0.2 + 2.0).sin()) as u64,
+                blocked: (10.0 + 8.0 * (i as f64 * 0.12 + 0.5).sin()) as u64,
+            }).collect(),
             blocklist_domain_count: 84_291,
             blocklist_last_refresh: "2 hours ago".to_string(),
             config: ConfigInfo {
@@ -388,52 +434,164 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
 
 fn render_middle(frame: &mut Frame, area: Rect, state: &DashboardState) {
     let chunks = Layout::default()
-        .direction(Direction::Horizontal)
+        .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(35), // QPS chart
-            Constraint::Percentage(65), // Query log
+            Constraint::Length(14), // 24h history chart
+            Constraint::Min(6),    // Query log
         ])
         .split(area);
 
-    render_qps_chart(frame, chunks[0], state);
+    render_history_chart(frame, chunks[0], state);
     render_query_log(frame, chunks[1], state);
 }
 
-fn render_qps_chart(frame: &mut Frame, area: Rect, state: &DashboardState) {
-    let data = if state.qps_history.is_empty() {
-        vec![0u64; 1]
-    } else {
-        state.qps_history.clone()
-    };
+fn render_history_chart(frame: &mut Frame, area: Rect, state: &DashboardState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Queries (24h) ")
+        .title_bottom(Line::from(vec![
+            Span::styled(" ─", Style::default().fg(Color::Green)),
+            Span::styled(" cache ", Style::default().fg(Color::DarkGray)),
+            Span::styled("─", Style::default().fg(Color::Magenta)),
+            Span::styled(" recursive ", Style::default().fg(Color::DarkGray)),
+            Span::styled("─", Style::default().fg(Color::Blue)),
+            Span::styled(" forwarded ", Style::default().fg(Color::DarkGray)),
+            Span::styled("─", Style::default().fg(Color::Red)),
+            Span::styled(" blocked ", Style::default().fg(Color::DarkGray)),
+        ]));
 
-    // How many bars fit in the available width (minus borders)
-    let available_width = area.width.saturating_sub(2) as usize;
-    let bar_width = 2u16;
-    let gap = 1u16;
-    let max_bars = available_width / (bar_width as usize + gap as usize);
-    let display_data: Vec<u64> = data.iter().rev().take(max_bars).rev().copied().collect();
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    let bars: Vec<Bar> = display_data
+    if state.query_history.is_empty() || inner.width < 10 || inner.height < 4 {
+        return;
+    }
+
+    // Prepare 4 series of (x, y) points, sorted by time
+    let mut cache_pts: Vec<(f64, f64)> = Vec::new();
+    let mut recursive_pts: Vec<(f64, f64)> = Vec::new();
+    let mut forwarded_pts: Vec<(f64, f64)> = Vec::new();
+    let mut blocked_pts: Vec<(f64, f64)> = Vec::new();
+
+    for b in &state.query_history {
+        let x = 1440.0 - b.mins_ago as f64; // 0=24h ago, 1440=now
+        cache_pts.push((x, b.cache as f64));
+        recursive_pts.push((x, b.recursive as f64));
+        forwarded_pts.push((x, b.forwarded as f64));
+        blocked_pts.push((x, b.blocked as f64));
+    }
+
+    for pts in [&mut cache_pts, &mut recursive_pts, &mut forwarded_pts, &mut blocked_pts] {
+        pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    }
+
+    let max_val = state
+        .query_history
         .iter()
-        .map(|&v| {
-            Bar::default()
-                .value(v)
-                .style(Style::default().fg(Color::Cyan))
-        })
-        .collect();
+        .flat_map(|b| [b.cache, b.recursive, b.forwarded, b.blocked])
+        .max()
+        .unwrap_or(1)
+        .max(1) as f64;
 
-    let chart = BarChart::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Queries/sec (last 60s) "),
-        )
-        .data(BarGroup::default().bars(&bars))
-        .bar_width(bar_width)
-        .bar_gap(gap)
-        .max(display_data.iter().copied().max().unwrap_or(1).max(1));
+    // Layout: [y-labels 5w] [canvas] on top, [padding 5w] [x-labels] on bottom
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
 
-    frame.render_widget(chart, area);
+    let top_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(5), Constraint::Min(1)])
+        .split(rows[0]);
+
+    let bot_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(5), Constraint::Min(1)])
+        .split(rows[1]);
+
+    let y_max = max_val * 1.1;
+
+    // Canvas with braille markers for smooth lines
+    let canvas = Canvas::default()
+        .x_bounds([0.0, 1440.0])
+        .y_bounds([0.0, y_max])
+        .marker(Marker::Braille)
+        .paint(|ctx| {
+            // Draw lines in back-to-front order (blocked behind, cache in front)
+            draw_series(ctx, &blocked_pts, Color::Red);
+            draw_series(ctx, &forwarded_pts, Color::Blue);
+            draw_series(ctx, &recursive_pts, Color::Magenta);
+            draw_series(ctx, &cache_pts, Color::Green);
+        });
+
+    frame.render_widget(canvas, top_cols[1]);
+
+    // Y-axis labels
+    let y_area = top_cols[0];
+    if y_area.height >= 3 {
+        let max_label = format_compact(max_val as u64);
+        let mid_label = format_compact((max_val / 2.0) as u64);
+
+        let y_text = Paragraph::new(vec![
+            Line::from(Span::styled(&max_label, Style::default().fg(Color::DarkGray))),
+            // Fill middle lines empty
+        ]);
+        frame.render_widget(y_text, Rect { height: 1, ..y_area });
+
+        let mid_y = y_area.y + y_area.height / 2;
+        let mid_area = Rect { x: y_area.x, y: mid_y, width: y_area.width, height: 1 };
+        frame.render_widget(
+            Paragraph::new(Span::styled(&mid_label, Style::default().fg(Color::DarkGray))),
+            mid_area,
+        );
+
+        let bot_y = y_area.y + y_area.height - 1;
+        let bot_area = Rect { x: y_area.x, y: bot_y, width: y_area.width, height: 1 };
+        frame.render_widget(
+            Paragraph::new(Span::styled("0", Style::default().fg(Color::DarkGray))),
+            bot_area,
+        );
+    }
+
+    // X-axis time labels
+    let x_area = bot_cols[1];
+    let w = x_area.width as usize;
+    if w > 20 {
+        let mut label_line = vec![Span::styled("24h", Style::default().fg(Color::DarkGray))];
+        let labels = ["18h", "12h", "6h", "now"];
+        for (i, lbl) in labels.iter().enumerate() {
+            let target_pos = ((i + 1) as f64 / 4.0 * w as f64) as usize;
+            let current_len: usize = label_line.iter().map(|s| s.width()).sum();
+            let padding = target_pos.saturating_sub(current_len + lbl.len() / 2);
+            if padding > 0 {
+                label_line.push(Span::raw(" ".repeat(padding)));
+            }
+            label_line.push(Span::styled(*lbl, Style::default().fg(Color::DarkGray)));
+        }
+        frame.render_widget(Paragraph::new(Line::from(label_line)), x_area);
+    }
+}
+
+fn draw_series(ctx: &mut ratatui::widgets::canvas::Context<'_>, points: &[(f64, f64)], color: Color) {
+    for w in points.windows(2) {
+        ctx.draw(&CanvasLine {
+            x1: w[0].0,
+            y1: w[0].1,
+            x2: w[1].0,
+            y2: w[1].1,
+            color,
+        });
+    }
+}
+
+fn format_compact(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.0}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.0}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
 }
 
 fn render_query_log(frame: &mut Frame, area: Rect, state: &DashboardState) {
@@ -559,19 +717,86 @@ fn render_config(frame: &mut Frame, area: Rect, state: &DashboardState) {
     frame.render_widget(blocklists, chunks[1]);
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, state: &DashboardState) {
-    let _ = state;
+fn render_footer(frame: &mut Frame, area: Rect, _state: &DashboardState) {
     let footer = Paragraph::new(Line::from(vec![
         Span::styled("  q", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         Span::styled(" quit  ", Style::default().fg(Color::DarkGray)),
         Span::styled("r", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled(" refresh blocklist  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("↑↓", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled(" scroll log", Style::default().fg(Color::DarkGray)),
+        Span::styled(" refresh  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("a", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(" add blocklist  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("d", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(" remove blocklist", Style::default().fg(Color::DarkGray)),
     ]))
     .wrap(Wrap { trim: false })
     .block(Block::default().borders(Borders::ALL).title(" Keys "));
     frame.render_widget(footer, area);
+}
+
+/// Render the dashboard with an optional input overlay in the footer area
+pub fn render_with_overlay(
+    frame: &mut Frame,
+    state: &DashboardState,
+    overlay: Option<&str>,
+    status: Option<&str>,
+) {
+    let size = frame.area();
+
+    // Determine footer height based on overlay content
+    let footer_height = if let Some(text) = overlay {
+        // Count lines in overlay + borders
+        (text.lines().count() as u16 + 2).max(3)
+    } else {
+        3
+    };
+
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),           // header
+            Constraint::Min(10),            // middle
+            Constraint::Length(8),          // config
+            Constraint::Length(footer_height), // footer / overlay
+        ])
+        .split(size);
+
+    render_header(frame, outer[0], state);
+    render_middle(frame, outer[1], state);
+    render_config(frame, outer[2], state);
+
+    if let Some(text) = overlay {
+        // Render input overlay instead of normal footer
+        let overlay_widget = Paragraph::new(text)
+            .style(Style::default().fg(Color::White))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Input ")
+                    .style(Style::default().fg(Color::Yellow)),
+            );
+        frame.render_widget(overlay_widget, outer[3]);
+    } else if let Some(status_text) = status {
+        // Render status message in footer
+        let footer = Paragraph::new(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(status_text, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled("  |  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("q", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(" quit  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("r", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(" refresh  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("a", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(" add  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("d", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(" remove", Style::default().fg(Color::DarkGray)),
+        ]))
+        .wrap(Wrap { trim: false })
+        .block(Block::default().borders(Borders::ALL).title(" Keys "));
+        frame.render_widget(footer, outer[3]);
+    } else {
+        render_footer(frame, outer[3], state);
+    }
 }
 
 fn format_number(n: u64) -> String {
