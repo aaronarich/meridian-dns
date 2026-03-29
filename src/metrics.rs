@@ -241,6 +241,19 @@ fn build_metrics_json(
         .map(|t| t.elapsed().as_secs())
         .unwrap_or(0);
 
+    // Build query history (24h in 10-minute buckets)
+    let history: Vec<String> = s
+        .query_history
+        .iter()
+        .map(|b| {
+            let mins_ago = b.window_start.elapsed().as_secs() / 60;
+            format!(
+                r#"{{"mins_ago":{},"cache":{},"recursive":{},"forwarded":{},"blocked":{}}}"#,
+                mins_ago, b.cache, b.recursive, b.forwarded, b.blocked,
+            )
+        })
+        .collect();
+
     let recent: Vec<String> = s
         .recent_queries
         .iter()
@@ -297,7 +310,7 @@ fn build_metrics_json(
         .collect();
 
     format!(
-        r#"{{"uptime_secs":{},"total_queries":{},"cache_hits":{},"cache_hit_rate":{:.1},"blocked_queries":{},"forwarded_queries":{},"recursive_queries":{},"blocklist_domains":{},"blocklist_last_refresh_secs_ago":{},"recent_queries":[{}],"config":{{"mode":"{}","listen":"{}","cache_max_entries":{},"blocklist_enabled":{},"blocklist_refresh_hours":{},"blocklist_sources":[{}],"upstreams":[{}]}}}}"#,
+        r#"{{"uptime_secs":{},"total_queries":{},"cache_hits":{},"cache_hit_rate":{:.1},"blocked_queries":{},"forwarded_queries":{},"recursive_queries":{},"blocklist_domains":{},"blocklist_last_refresh_secs_ago":{},"query_history":[{}],"recent_queries":[{}],"config":{{"mode":"{}","listen":"{}","cache_max_entries":{},"blocklist_enabled":{},"blocklist_refresh_hours":{},"blocklist_sources":[{}],"upstreams":[{}]}}}}"#,
         uptime_secs,
         s.total_queries,
         s.cache_hits,
@@ -307,6 +320,7 @@ fn build_metrics_json(
         s.recursive_queries,
         blocklist_count,
         blocklist_last_refresh,
+        history.join(","),
         recent.join(","),
         mode,
         config.listen,

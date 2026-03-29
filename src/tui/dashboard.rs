@@ -1,10 +1,11 @@
 use std::time::{Duration, Instant};
 
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Bar, BarChart, BarGroup, Block, Borders, Cell, Paragraph, Row, Table, Wrap,
+    Block, Borders, Cell, Paragraph, Row, Table, Widget, Wrap,
 };
 use ratatui::Frame;
 
@@ -22,7 +23,7 @@ pub struct DashboardState {
     pub forwarded_queries: u64,
     pub recursive_queries: u64,
     pub recent_queries: Vec<RecentQuery>,
-    pub qps_history: Vec<u64>,
+    pub query_history: Vec<HistoryBucket>,
     pub blocklist_domain_count: usize,
     pub blocklist_last_refresh: String,
     pub config: ConfigInfo,
@@ -62,6 +63,22 @@ impl Default for ConfigInfo {
     }
 }
 
+/// A 10-minute bucket of query history broken down by method
+#[derive(Clone)]
+pub struct HistoryBucket {
+    pub mins_ago: u64,
+    pub cache: u64,
+    pub recursive: u64,
+    pub forwarded: u64,
+    pub blocked: u64,
+}
+
+impl HistoryBucket {
+    pub fn total(&self) -> u64 {
+        self.cache + self.recursive + self.forwarded + self.blocked
+    }
+}
+
 pub struct RecentQuery {
     pub domain: String,
     pub record_type: String,
@@ -90,10 +107,16 @@ impl DashboardState {
             })
             .collect();
 
-        let qps_history: Vec<u64> = s
-            .queries_per_second
+        let query_history: Vec<HistoryBucket> = s
+            .query_history
             .iter()
-            .map(|(_, count)| *count)
+            .map(|b| HistoryBucket {
+                mins_ago: b.window_start.elapsed().as_secs() / 60,
+                cache: b.cache,
+                recursive: b.recursive,
+                forwarded: b.forwarded,
+                blocked: b.blocked,
+            })
             .collect();
 
         Self {
@@ -106,7 +129,7 @@ impl DashboardState {
             forwarded_queries: s.forwarded_queries,
             recursive_queries: s.recursive_queries,
             recent_queries,
-            qps_history,
+            query_history,
             blocklist_domain_count: 0,
             blocklist_last_refresh: "N/A".to_string(),
             config: ConfigInfo::default(),
@@ -143,6 +166,21 @@ impl DashboardState {
         } else {
             ResolverMode::Forwarding
         };
+
+        let query_history: Vec<HistoryBucket> = v["query_history"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|b| HistoryBucket {
+                        mins_ago: b["mins_ago"].as_u64().unwrap_or(0),
+                        cache: b["cache"].as_u64().unwrap_or(0),
+                        recursive: b["recursive"].as_u64().unwrap_or(0),
+                        forwarded: b["forwarded"].as_u64().unwrap_or(0),
+                        blocked: b["blocked"].as_u64().unwrap_or(0),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let recent_queries: Vec<RecentQuery> = v["recent_queries"]
             .as_array()
@@ -210,7 +248,7 @@ impl DashboardState {
             forwarded_queries,
             recursive_queries,
             recent_queries,
-            qps_history: Vec::new(),
+            query_history,
             blocklist_domain_count,
             blocklist_last_refresh,
             config: config_info,
@@ -245,7 +283,13 @@ impl DashboardState {
             forwarded_queries: 1_203,
             recursive_queries: 3_191,
             recent_queries,
-            qps_history: vec![12, 8, 15, 22, 18, 9, 14, 25, 31, 19, 11, 7, 16, 20, 27, 13, 10, 23, 17, 14],
+            query_history: (0..144).rev().map(|i| HistoryBucket {
+                mins_ago: i * 10,
+                cache: (50.0 + 30.0 * (i as f64 * 0.15).sin()) as u64,
+                recursive: (20.0 + 15.0 * (i as f64 * 0.1 + 1.0).sin()) as u64,
+                forwarded: (15.0 + 10.0 * (i as f64 * 0.2 + 2.0).sin()) as u64,
+                blocked: (10.0 + 8.0 * (i as f64 * 0.12 + 0.5).sin()) as u64,
+            }).collect(),
             blocklist_domain_count: 84_291,
             blocklist_last_refresh: "2 hours ago".to_string(),
             config: ConfigInfo {
@@ -389,52 +433,216 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
 
 fn render_middle(frame: &mut Frame, area: Rect, state: &DashboardState) {
     let chunks = Layout::default()
-        .direction(Direction::Horizontal)
+        .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(35), // QPS chart
-            Constraint::Percentage(65), // Query log
+            Constraint::Length(12), // 24h history chart
+            Constraint::Min(6),    // Query log
         ])
         .split(area);
 
-    render_qps_chart(frame, chunks[0], state);
+    render_history_chart(frame, chunks[0], state);
     render_query_log(frame, chunks[1], state);
 }
 
-fn render_qps_chart(frame: &mut Frame, area: Rect, state: &DashboardState) {
-    let data = if state.qps_history.is_empty() {
-        vec![0u64; 1]
+/// A custom stacked bar chart widget for 24-hour query history
+struct StackedBarChart<'a> {
+    data: &'a [HistoryBucket],
+}
+
+impl<'a> Widget for StackedBarChart<'a> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.width < 4 || area.height < 3 {
+            return;
+        }
+
+        // Reserve space: 1 row for x-axis labels, 5 chars for y-axis labels
+        let y_label_width = 5u16;
+        let chart_x = area.x + y_label_width;
+        let chart_width = area.width.saturating_sub(y_label_width) as usize;
+        let chart_height = area.height.saturating_sub(1) as usize; // 1 for x-axis
+        let chart_y = area.y;
+
+        if chart_width == 0 || chart_height == 0 {
+            return;
+        }
+
+        // Downsample data to fit available columns
+        let buckets = self.downsample(chart_width);
+        let max_val = buckets.iter().map(|b| b.total()).max().unwrap_or(1).max(1);
+
+        // Draw bars
+        for (col, bucket) in buckets.iter().enumerate() {
+            let x = chart_x + col as u16;
+            if x >= area.x + area.width {
+                break;
+            }
+
+            let total = bucket.total();
+            if total == 0 {
+                continue;
+            }
+
+            // Calculate pixel heights for each segment (bottom to top: blocked, forwarded, recursive, cache)
+            let total_pixels = (total as f64 / max_val as f64 * chart_height as f64).round() as usize;
+            let blocked_px = (bucket.blocked as f64 / total as f64 * total_pixels as f64).round() as usize;
+            let fwd_px = (bucket.forwarded as f64 / total as f64 * total_pixels as f64).round() as usize;
+            let rec_px = (bucket.recursive as f64 / total as f64 * total_pixels as f64).round() as usize;
+            let cache_px = total_pixels.saturating_sub(blocked_px + fwd_px + rec_px);
+
+            // Draw from bottom of chart area upward
+            let mut row = chart_height;
+            let segments = [
+                (blocked_px, Color::Red),
+                (fwd_px, Color::Blue),
+                (rec_px, Color::Magenta),
+                (cache_px, Color::Green),
+            ];
+
+            for (height, color) in segments {
+                for _ in 0..height {
+                    if row == 0 {
+                        break;
+                    }
+                    row -= 1;
+                    let y = chart_y + row as u16;
+                    if y < area.y + area.height {
+                        buf[(x, y)]
+                            .set_char('█')
+                            .set_fg(color);
+                    }
+                }
+            }
+        }
+
+        // Y-axis labels
+        let max_label = format_compact(max_val);
+        let mid_label = format_compact(max_val / 2);
+        if chart_height > 2 {
+            let label_x = area.x;
+            // Top label
+            for (i, ch) in max_label.chars().enumerate() {
+                if label_x + i as u16 >= chart_x {
+                    break;
+                }
+                buf[(label_x + i as u16, chart_y)]
+                    .set_char(ch)
+                    .set_fg(Color::DarkGray);
+            }
+            // Mid label
+            let mid_y = chart_y + (chart_height / 2) as u16;
+            for (i, ch) in mid_label.chars().enumerate() {
+                if label_x + i as u16 >= chart_x {
+                    break;
+                }
+                buf[(label_x + i as u16, mid_y)]
+                    .set_char(ch)
+                    .set_fg(Color::DarkGray);
+            }
+            // Zero
+            buf[(label_x, chart_y + chart_height as u16 - 1)]
+                .set_char('0')
+                .set_fg(Color::DarkGray);
+        }
+
+        // X-axis time labels
+        let label_y = chart_y + chart_height as u16;
+        if label_y < area.y + area.height {
+            let labels = ["24h", "18h", "12h", "6h", "now"];
+            for (i, label) in labels.iter().enumerate() {
+                let frac = i as f64 / (labels.len() - 1) as f64;
+                let lx = chart_x + (frac * (chart_width.saturating_sub(label.len())) as f64) as u16;
+                for (j, ch) in label.chars().enumerate() {
+                    let x = lx + j as u16;
+                    if x < area.x + area.width {
+                        buf[(x, label_y)]
+                            .set_char(ch)
+                            .set_fg(Color::DarkGray);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<'a> StackedBarChart<'a> {
+    /// Downsample the history data to fit the target number of columns.
+    /// Data is ordered oldest-first, so we aggregate into `target` bins.
+    fn downsample(&self, target: usize) -> Vec<HistoryBucket> {
+        if self.data.is_empty() {
+            return vec![HistoryBucket { mins_ago: 0, cache: 0, recursive: 0, forwarded: 0, blocked: 0 }; target];
+        }
+
+        // Sort by mins_ago descending (oldest first) for display left-to-right
+        let mut sorted: Vec<&HistoryBucket> = self.data.iter().collect();
+        sorted.sort_by(|a, b| b.mins_ago.cmp(&a.mins_ago));
+
+        if sorted.len() <= target {
+            // Pad with empty buckets on the left (older end)
+            let mut result: Vec<HistoryBucket> = Vec::with_capacity(target);
+            let padding = target - sorted.len();
+            for i in 0..padding {
+                result.push(HistoryBucket {
+                    mins_ago: (target - i) as u64 * 10,
+                    cache: 0, recursive: 0, forwarded: 0, blocked: 0,
+                });
+            }
+            for b in sorted {
+                result.push(b.clone());
+            }
+            return result;
+        }
+
+        // Aggregate multiple buckets per column
+        let chunk_size = sorted.len() as f64 / target as f64;
+        let mut result = Vec::with_capacity(target);
+        for i in 0..target {
+            let start = (i as f64 * chunk_size) as usize;
+            let end = ((i + 1) as f64 * chunk_size) as usize;
+            let end = end.min(sorted.len());
+            let mut agg = HistoryBucket {
+                mins_ago: sorted.get(start).map(|b| b.mins_ago).unwrap_or(0),
+                cache: 0, recursive: 0, forwarded: 0, blocked: 0,
+            };
+            for b in &sorted[start..end] {
+                agg.cache += b.cache;
+                agg.recursive += b.recursive;
+                agg.forwarded += b.forwarded;
+                agg.blocked += b.blocked;
+            }
+            result.push(agg);
+        }
+        result
+    }
+}
+
+fn format_compact(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.0}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.0}K", n as f64 / 1_000.0)
     } else {
-        state.qps_history.clone()
-    };
+        n.to_string()
+    }
+}
 
-    // How many bars fit in the available width (minus borders)
-    let available_width = area.width.saturating_sub(2) as usize;
-    let bar_width = 2u16;
-    let gap = 1u16;
-    let max_bars = available_width / (bar_width as usize + gap as usize);
-    let display_data: Vec<u64> = data.iter().rev().take(max_bars).rev().copied().collect();
+fn render_history_chart(frame: &mut Frame, area: Rect, state: &DashboardState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Queries (24h) ")
+        .title_bottom(Line::from(vec![
+            Span::styled(" ■", Style::default().fg(Color::Green)),
+            Span::styled(" cache ", Style::default().fg(Color::DarkGray)),
+            Span::styled("■", Style::default().fg(Color::Magenta)),
+            Span::styled(" recursive ", Style::default().fg(Color::DarkGray)),
+            Span::styled("■", Style::default().fg(Color::Blue)),
+            Span::styled(" forwarded ", Style::default().fg(Color::DarkGray)),
+            Span::styled("■", Style::default().fg(Color::Red)),
+            Span::styled(" blocked ", Style::default().fg(Color::DarkGray)),
+        ]));
 
-    let bars: Vec<Bar> = display_data
-        .iter()
-        .map(|&v| {
-            Bar::default()
-                .value(v)
-                .style(Style::default().fg(Color::Cyan))
-        })
-        .collect();
-
-    let chart = BarChart::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Queries/sec (last 60s) "),
-        )
-        .data(BarGroup::default().bars(&bars))
-        .bar_width(bar_width)
-        .bar_gap(gap)
-        .max(display_data.iter().copied().max().unwrap_or(1).max(1));
-
-    frame.render_widget(chart, area);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(StackedBarChart { data: &state.query_history }, inner);
 }
 
 fn render_query_log(frame: &mut Frame, area: Rect, state: &DashboardState) {

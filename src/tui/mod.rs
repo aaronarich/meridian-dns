@@ -36,7 +36,6 @@ struct StatusMessage {
 /// Run the TUI connected to the metrics HTTP endpoint
 pub fn run_remote(metrics_url: &str, tui_config: &TuiConfig) -> Result<(), io::Error> {
     use std::sync::{Arc, Mutex};
-    use std::time::Instant;
 
     let mut terminal = setup_terminal()?;
     let tick_rate = Duration::from_millis(tui_config.tick_rate_ms);
@@ -78,9 +77,6 @@ pub fn run_remote(metrics_url: &str, tui_config: &TuiConfig) -> Result<(), io::E
         .ok();
 
     let mut last_state: Option<DashboardState> = None;
-    let mut qps_history: Vec<u64> = Vec::new();
-    let mut last_total_queries: Option<u64> = None;
-    let mut last_sample = Instant::now();
     let mut input_mode = InputMode::Normal;
     let mut status_msg: Option<StatusMessage> = None;
 
@@ -88,24 +84,7 @@ pub fn run_remote(metrics_url: &str, tui_config: &TuiConfig) -> Result<(), io::E
         // Check for new metrics data (non-blocking)
         if let Ok(mut lock) = shared.try_lock() {
             if let Some(body) = lock.take() {
-                if let Some(mut state) = DashboardState::from_json(&body) {
-                    // Build QPS history from delta between fetches
-                    let now = Instant::now();
-                    let elapsed = now.duration_since(last_sample).as_secs_f64();
-                    if let Some(prev) = last_total_queries {
-                        if elapsed > 0.0 {
-                            let delta = state.total_queries.saturating_sub(prev);
-                            let qps = (delta as f64 / elapsed).round() as u64;
-                            qps_history.push(qps);
-                            if qps_history.len() > 60 {
-                                qps_history.remove(0);
-                            }
-                        }
-                    }
-                    last_total_queries = Some(state.total_queries);
-                    last_sample = now;
-
-                    state.qps_history = qps_history.clone();
+                if let Some(state) = DashboardState::from_json(&body) {
                     last_state = Some(state);
                 }
             }
