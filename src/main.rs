@@ -80,7 +80,13 @@ async fn main() {
             info!(mode = ?config.mode, listen = %config.listen, "starting meridian DNS resolver");
 
             let shared_stats = stats::new_shared_stats();
-            let shared_cache = cache::new_shared_cache(config.cache.max_entries);
+            let shared_cache = cache::new_shared_cache(
+                config.cache.max_entries,
+                config.cache.min_ttl_secs,
+                config.cache.negative_ttl_secs,
+                config.cache.prefetch,
+                config.cache.prefetch_threshold,
+            );
             let shared_blocklist = blocklist::new_shared_blocklist();
 
             // Load blocklists on startup

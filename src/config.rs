@@ -39,22 +39,30 @@ pub struct Config {
 pub struct CacheConfig {
     #[serde(default = "default_max_entries")]
     pub max_entries: usize,
-    /// Minimum TTL floor in seconds — prevents very low TTLs from defeating the cache
+    /// Minimum TTL floor in seconds — short upstream TTLs are raised to this value
     #[serde(default = "default_min_ttl")]
-    pub min_ttl: u32,
+    pub min_ttl_secs: u64,
+    /// TTL for negative cache entries (NXDOMAIN / SERVFAIL), 0 to disable
+    #[serde(default = "default_negative_ttl")]
+    pub negative_ttl_secs: u64,
+    /// Enable background prefetching of entries nearing expiry
+    #[serde(default)]
+    pub prefetch: bool,
+    /// Prefetch when remaining TTL falls below this fraction of original TTL (0.0–1.0)
+    #[serde(default = "default_prefetch_threshold")]
+    pub prefetch_threshold: f64,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             max_entries: default_max_entries(),
-            min_ttl: default_min_ttl(),
+            min_ttl_secs: default_min_ttl(),
+            negative_ttl_secs: default_negative_ttl(),
+            prefetch: false,
+            prefetch_threshold: default_prefetch_threshold(),
         }
     }
-}
-
-fn default_min_ttl() -> u32 {
-    30
 }
 
 fn default_listen_addr() -> SocketAddr {
@@ -63,6 +71,18 @@ fn default_listen_addr() -> SocketAddr {
 
 fn default_max_entries() -> usize {
     10_000
+}
+
+fn default_min_ttl() -> u64 {
+    300 // 5 minutes
+}
+
+fn default_negative_ttl() -> u64 {
+    300 // 5 minutes
+}
+
+fn default_prefetch_threshold() -> f64 {
+    0.1 // prefetch when 10% TTL remains
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -186,6 +206,10 @@ mode = "recursive"
 
 [cache]
 max_entries = 5000
+min_ttl_secs = 600
+negative_ttl_secs = 120
+prefetch = true
+prefetch_threshold = 0.2
 
 [blocklist]
 enabled = true
@@ -215,6 +239,10 @@ protocol = "doq"
         let config: Config = toml::from_str(toml_str).unwrap();
         assert!(matches!(config.mode, ResolverMode::Recursive));
         assert_eq!(config.cache.max_entries, 5000);
+        assert_eq!(config.cache.min_ttl_secs, 600);
+        assert_eq!(config.cache.negative_ttl_secs, 120);
+        assert!(config.cache.prefetch);
+        assert!((config.cache.prefetch_threshold - 0.2).abs() < f64::EPSILON);
         assert_eq!(config.blocklist.sources.len(), 1);
         assert_eq!(config.upstream.servers.len(), 2);
     }
@@ -225,6 +253,9 @@ protocol = "doq"
         let config: Config = toml::from_str(toml_str).unwrap();
         assert!(matches!(config.mode, ResolverMode::Forwarding));
         assert_eq!(config.cache.max_entries, 10_000);
+        assert_eq!(config.cache.min_ttl_secs, 300); // default
+        assert_eq!(config.cache.negative_ttl_secs, 300); // default
+        assert!(!config.cache.prefetch); // default off
         assert!(config.blocklist.enabled);
     }
 

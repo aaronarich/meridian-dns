@@ -8,7 +8,6 @@ use tokio::net::UdpSocket;
 use tracing::{debug, warn};
 
 use crate::cache::{CacheKey, SharedCache};
-use crate::config::CacheConfig;
 
 const MAX_RECURSION_DEPTH: usize = 20;
 const MAX_CNAME_CHAIN: usize = 10;
@@ -50,7 +49,6 @@ pub enum RecursiveError {
 pub async fn resolve(
     request: &Message,
     cache: &SharedCache,
-    cache_config: &CacheConfig,
 ) -> Result<Message, RecursiveError> {
     let query = request
         .queries()
@@ -66,7 +64,7 @@ pub async fn resolve(
     let mut accumulated_cnames: Vec<hickory_proto::rr::Record> = Vec::new();
 
     loop {
-        let result = resolve_name(&current_name, record_type, cache, cache_config).await?;
+        let result = resolve_name(&current_name, record_type, cache).await?;
 
         // Check if we got actual answers for the requested type
         let has_target_answers = result
@@ -159,23 +157,23 @@ fn cache_lookup(cache: &SharedCache, name: &Name, record_type: RecordType) -> Op
         name: name.to_string().to_lowercase(),
         record_type,
     };
-    let (bytes, _remaining) = cache.write().ok()?.lookup(&key)?;
-    Message::from_bytes(&bytes).ok()
+    let lookup = cache.write().ok()?.lookup(&key)?;
+    Message::from_bytes(&lookup.bytes).ok()
 }
 
 /// Store a response in the shared cache, keyed by name + record type.
-fn cache_store(cache: &SharedCache, name: &Name, record_type: RecordType, response: &Message, min_ttl: u32) {
+fn cache_store(cache: &SharedCache, name: &Name, record_type: RecordType, response: &Message) {
     let key = CacheKey {
         name: name.to_string().to_lowercase(),
         record_type,
     };
     if let Ok(mut c) = cache.write() {
-        c.insert(key, response, min_ttl);
+        c.insert(key, response);
     }
 }
 
 /// Cache all useful records from a referral response (NS records, glue A/AAAA records)
-fn cache_referral(cache: &SharedCache, response: &Message, min_ttl: u32) {
+fn cache_referral(cache: &SharedCache, response: &Message) {
     // Cache glue A records from the additional section
     for additional in response.additionals() {
         let rtype = additional.record_type();
@@ -191,7 +189,7 @@ fn cache_referral(cache: &SharedCache, response: &Message, min_ttl: u32) {
                 record_type: rtype,
             };
             if let Ok(mut c) = cache.write() {
-                c.insert(key, &glue_msg, min_ttl);
+                c.insert(key, &glue_msg);
             }
         }
     }
@@ -203,10 +201,7 @@ async fn resolve_name(
     name: &Name,
     record_type: RecordType,
     cache: &SharedCache,
-    cache_config: &CacheConfig,
 ) -> Result<Message, RecursiveError> {
-    let min_ttl = cache_config.min_ttl;
-
     // Check if we already have the final answer cached
     if let Some(cached) = cache_lookup(cache, name, record_type) {
         if !cached.answers().is_empty() || cached.response_code() == ResponseCode::NXDomain {
@@ -237,7 +232,7 @@ async fn resolve_name(
             || response.response_code() == ResponseCode::NXDomain
         {
             // Cache the final answer
-            cache_store(cache, name, record_type, &response, min_ttl);
+            cache_store(cache, name, record_type, &response);
             return Ok(response);
         }
 
@@ -247,7 +242,7 @@ async fn resolve_name(
         }
 
         // Cache all glue/NS records from the referral
-        cache_referral(cache, &response, min_ttl);
+        cache_referral(cache, &response);
 
         // Extract NS referral — get IP addresses from the additional section
         let mut next_nameservers: Vec<SocketAddr> = Vec::new();
@@ -312,7 +307,7 @@ async fn resolve_name(
                 query_nameservers(ns_name, RecordType::A, &nameservers).await
             {
                 // Cache the NS address for future use
-                cache_store(cache, ns_name, RecordType::A, &ns_response, min_ttl);
+                cache_store(cache, ns_name, RecordType::A, &ns_response);
 
                 for answer in ns_response.answers() {
                     if let RData::A(addr) = answer.data() {

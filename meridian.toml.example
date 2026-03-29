@@ -2,6 +2,10 @@ mode = "recursive" # or "forwarding"
 
 [cache]
 max_entries = 10000
+min_ttl_secs = 300           # floor for short upstream TTLs (improves hit rate)
+negative_ttl_secs = 300      # cache NXDOMAIN/SERVFAIL responses for 5 minutes
+prefetch = true              # background re-resolve entries nearing expiry
+prefetch_threshold = 0.1     # prefetch when <10% of original TTL remains
 
 [blocklist]
 enabled = true

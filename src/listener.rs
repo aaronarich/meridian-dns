@@ -267,7 +267,7 @@ mod tests {
         let config: Config = toml::from_str(r#"mode = "forwarding""#).unwrap();
         HandlerCtx {
             stats: new_shared_stats(),
-            cache: new_shared_cache(100),
+            cache: new_shared_cache(100, 0, 300, false, 0.1),
             config: Arc::new(config),
             blocklist: new_shared_blocklist(),
         }
