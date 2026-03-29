@@ -1,11 +1,12 @@
 use std::time::{Duration, Instant};
 
-use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
+use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
 use ratatui::widgets::{
-    Block, Borders, Cell, Paragraph, Row, Table, Widget, Wrap,
+    Block, Borders, Cell, Paragraph, Row, Table, Wrap,
 };
 use ratatui::Frame;
 
@@ -435,7 +436,7 @@ fn render_middle(frame: &mut Frame, area: Rect, state: &DashboardState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(12), // 24h history chart
+            Constraint::Length(14), // 24h history chart
             Constraint::Min(6),    // Query log
         ])
         .split(area);
@@ -444,174 +445,142 @@ fn render_middle(frame: &mut Frame, area: Rect, state: &DashboardState) {
     render_query_log(frame, chunks[1], state);
 }
 
-/// A custom stacked bar chart widget for 24-hour query history
-struct StackedBarChart<'a> {
-    data: &'a [HistoryBucket],
-}
+fn render_history_chart(frame: &mut Frame, area: Rect, state: &DashboardState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Queries (24h) ")
+        .title_bottom(Line::from(vec![
+            Span::styled(" ─", Style::default().fg(Color::Green)),
+            Span::styled(" cache ", Style::default().fg(Color::DarkGray)),
+            Span::styled("─", Style::default().fg(Color::Magenta)),
+            Span::styled(" recursive ", Style::default().fg(Color::DarkGray)),
+            Span::styled("─", Style::default().fg(Color::Blue)),
+            Span::styled(" forwarded ", Style::default().fg(Color::DarkGray)),
+            Span::styled("─", Style::default().fg(Color::Red)),
+            Span::styled(" blocked ", Style::default().fg(Color::DarkGray)),
+        ]));
 
-impl<'a> Widget for StackedBarChart<'a> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.width < 4 || area.height < 3 {
-            return;
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if state.query_history.is_empty() || inner.width < 10 || inner.height < 4 {
+        return;
+    }
+
+    // Prepare 4 series of (x, y) points, sorted by time
+    let mut cache_pts: Vec<(f64, f64)> = Vec::new();
+    let mut recursive_pts: Vec<(f64, f64)> = Vec::new();
+    let mut forwarded_pts: Vec<(f64, f64)> = Vec::new();
+    let mut blocked_pts: Vec<(f64, f64)> = Vec::new();
+
+    for b in &state.query_history {
+        let x = 1440.0 - b.mins_ago as f64; // 0=24h ago, 1440=now
+        cache_pts.push((x, b.cache as f64));
+        recursive_pts.push((x, b.recursive as f64));
+        forwarded_pts.push((x, b.forwarded as f64));
+        blocked_pts.push((x, b.blocked as f64));
+    }
+
+    for pts in [&mut cache_pts, &mut recursive_pts, &mut forwarded_pts, &mut blocked_pts] {
+        pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    }
+
+    let max_val = state
+        .query_history
+        .iter()
+        .flat_map(|b| [b.cache, b.recursive, b.forwarded, b.blocked])
+        .max()
+        .unwrap_or(1)
+        .max(1) as f64;
+
+    // Layout: [y-labels 5w] [canvas] on top, [padding 5w] [x-labels] on bottom
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let top_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(5), Constraint::Min(1)])
+        .split(rows[0]);
+
+    let bot_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(5), Constraint::Min(1)])
+        .split(rows[1]);
+
+    let y_max = max_val * 1.1;
+
+    // Canvas with braille markers for smooth lines
+    let canvas = Canvas::default()
+        .x_bounds([0.0, 1440.0])
+        .y_bounds([0.0, y_max])
+        .marker(Marker::Braille)
+        .paint(|ctx| {
+            // Draw lines in back-to-front order (blocked behind, cache in front)
+            draw_series(ctx, &blocked_pts, Color::Red);
+            draw_series(ctx, &forwarded_pts, Color::Blue);
+            draw_series(ctx, &recursive_pts, Color::Magenta);
+            draw_series(ctx, &cache_pts, Color::Green);
+        });
+
+    frame.render_widget(canvas, top_cols[1]);
+
+    // Y-axis labels
+    let y_area = top_cols[0];
+    if y_area.height >= 3 {
+        let max_label = format_compact(max_val as u64);
+        let mid_label = format_compact((max_val / 2.0) as u64);
+
+        let y_text = Paragraph::new(vec![
+            Line::from(Span::styled(&max_label, Style::default().fg(Color::DarkGray))),
+            // Fill middle lines empty
+        ]);
+        frame.render_widget(y_text, Rect { height: 1, ..y_area });
+
+        let mid_y = y_area.y + y_area.height / 2;
+        let mid_area = Rect { x: y_area.x, y: mid_y, width: y_area.width, height: 1 };
+        frame.render_widget(
+            Paragraph::new(Span::styled(&mid_label, Style::default().fg(Color::DarkGray))),
+            mid_area,
+        );
+
+        let bot_y = y_area.y + y_area.height - 1;
+        let bot_area = Rect { x: y_area.x, y: bot_y, width: y_area.width, height: 1 };
+        frame.render_widget(
+            Paragraph::new(Span::styled("0", Style::default().fg(Color::DarkGray))),
+            bot_area,
+        );
+    }
+
+    // X-axis time labels
+    let x_area = bot_cols[1];
+    let w = x_area.width as usize;
+    if w > 20 {
+        let mut label_line = vec![Span::styled("24h", Style::default().fg(Color::DarkGray))];
+        let labels = ["18h", "12h", "6h", "now"];
+        for (i, lbl) in labels.iter().enumerate() {
+            let target_pos = ((i + 1) as f64 / 4.0 * w as f64) as usize;
+            let current_len: usize = label_line.iter().map(|s| s.width()).sum();
+            let padding = target_pos.saturating_sub(current_len + lbl.len() / 2);
+            if padding > 0 {
+                label_line.push(Span::raw(" ".repeat(padding)));
+            }
+            label_line.push(Span::styled(*lbl, Style::default().fg(Color::DarkGray)));
         }
-
-        // Reserve space: 1 row for x-axis labels, 5 chars for y-axis labels
-        let y_label_width = 5u16;
-        let chart_x = area.x + y_label_width;
-        let chart_width = area.width.saturating_sub(y_label_width) as usize;
-        let chart_height = area.height.saturating_sub(1) as usize; // 1 for x-axis
-        let chart_y = area.y;
-
-        if chart_width == 0 || chart_height == 0 {
-            return;
-        }
-
-        // Downsample data to fit available columns
-        let buckets = self.downsample(chart_width);
-        let max_val = buckets.iter().map(|b| b.total()).max().unwrap_or(1).max(1);
-
-        // Draw bars
-        for (col, bucket) in buckets.iter().enumerate() {
-            let x = chart_x + col as u16;
-            if x >= area.x + area.width {
-                break;
-            }
-
-            let total = bucket.total();
-            if total == 0 {
-                continue;
-            }
-
-            // Calculate pixel heights for each segment (bottom to top: blocked, forwarded, recursive, cache)
-            let total_pixels = (total as f64 / max_val as f64 * chart_height as f64).round() as usize;
-            let blocked_px = (bucket.blocked as f64 / total as f64 * total_pixels as f64).round() as usize;
-            let fwd_px = (bucket.forwarded as f64 / total as f64 * total_pixels as f64).round() as usize;
-            let rec_px = (bucket.recursive as f64 / total as f64 * total_pixels as f64).round() as usize;
-            let cache_px = total_pixels.saturating_sub(blocked_px + fwd_px + rec_px);
-
-            // Draw from bottom of chart area upward
-            let mut row = chart_height;
-            let segments = [
-                (blocked_px, Color::Red),
-                (fwd_px, Color::Blue),
-                (rec_px, Color::Magenta),
-                (cache_px, Color::Green),
-            ];
-
-            for (height, color) in segments {
-                for _ in 0..height {
-                    if row == 0 {
-                        break;
-                    }
-                    row -= 1;
-                    let y = chart_y + row as u16;
-                    if y < area.y + area.height {
-                        buf[(x, y)]
-                            .set_char('█')
-                            .set_fg(color);
-                    }
-                }
-            }
-        }
-
-        // Y-axis labels
-        let max_label = format_compact(max_val);
-        let mid_label = format_compact(max_val / 2);
-        if chart_height > 2 {
-            let label_x = area.x;
-            // Top label
-            for (i, ch) in max_label.chars().enumerate() {
-                if label_x + i as u16 >= chart_x {
-                    break;
-                }
-                buf[(label_x + i as u16, chart_y)]
-                    .set_char(ch)
-                    .set_fg(Color::DarkGray);
-            }
-            // Mid label
-            let mid_y = chart_y + (chart_height / 2) as u16;
-            for (i, ch) in mid_label.chars().enumerate() {
-                if label_x + i as u16 >= chart_x {
-                    break;
-                }
-                buf[(label_x + i as u16, mid_y)]
-                    .set_char(ch)
-                    .set_fg(Color::DarkGray);
-            }
-            // Zero
-            buf[(label_x, chart_y + chart_height as u16 - 1)]
-                .set_char('0')
-                .set_fg(Color::DarkGray);
-        }
-
-        // X-axis time labels
-        let label_y = chart_y + chart_height as u16;
-        if label_y < area.y + area.height {
-            let labels = ["24h", "18h", "12h", "6h", "now"];
-            for (i, label) in labels.iter().enumerate() {
-                let frac = i as f64 / (labels.len() - 1) as f64;
-                let lx = chart_x + (frac * (chart_width.saturating_sub(label.len())) as f64) as u16;
-                for (j, ch) in label.chars().enumerate() {
-                    let x = lx + j as u16;
-                    if x < area.x + area.width {
-                        buf[(x, label_y)]
-                            .set_char(ch)
-                            .set_fg(Color::DarkGray);
-                    }
-                }
-            }
-        }
+        frame.render_widget(Paragraph::new(Line::from(label_line)), x_area);
     }
 }
 
-impl<'a> StackedBarChart<'a> {
-    /// Downsample the history data to fit the target number of columns.
-    /// Data is ordered oldest-first, so we aggregate into `target` bins.
-    fn downsample(&self, target: usize) -> Vec<HistoryBucket> {
-        if self.data.is_empty() {
-            return vec![HistoryBucket { mins_ago: 0, cache: 0, recursive: 0, forwarded: 0, blocked: 0 }; target];
-        }
-
-        // Sort by mins_ago descending (oldest first) for display left-to-right
-        let mut sorted: Vec<&HistoryBucket> = self.data.iter().collect();
-        sorted.sort_by(|a, b| b.mins_ago.cmp(&a.mins_ago));
-
-        if sorted.len() <= target {
-            // Pad with empty buckets on the left (older end)
-            let mut result: Vec<HistoryBucket> = Vec::with_capacity(target);
-            let padding = target - sorted.len();
-            for i in 0..padding {
-                result.push(HistoryBucket {
-                    mins_ago: (target - i) as u64 * 10,
-                    cache: 0, recursive: 0, forwarded: 0, blocked: 0,
-                });
-            }
-            for b in sorted {
-                result.push(b.clone());
-            }
-            return result;
-        }
-
-        // Aggregate multiple buckets per column
-        let chunk_size = sorted.len() as f64 / target as f64;
-        let mut result = Vec::with_capacity(target);
-        for i in 0..target {
-            let start = (i as f64 * chunk_size) as usize;
-            let end = ((i + 1) as f64 * chunk_size) as usize;
-            let end = end.min(sorted.len());
-            let mut agg = HistoryBucket {
-                mins_ago: sorted.get(start).map(|b| b.mins_ago).unwrap_or(0),
-                cache: 0, recursive: 0, forwarded: 0, blocked: 0,
-            };
-            for b in &sorted[start..end] {
-                agg.cache += b.cache;
-                agg.recursive += b.recursive;
-                agg.forwarded += b.forwarded;
-                agg.blocked += b.blocked;
-            }
-            result.push(agg);
-        }
-        result
+fn draw_series(ctx: &mut ratatui::widgets::canvas::Context<'_>, points: &[(f64, f64)], color: Color) {
+    for w in points.windows(2) {
+        ctx.draw(&CanvasLine {
+            x1: w[0].0,
+            y1: w[0].1,
+            x2: w[1].0,
+            y2: w[1].1,
+            color,
+        });
     }
 }
 
@@ -623,26 +592,6 @@ fn format_compact(n: u64) -> String {
     } else {
         n.to_string()
     }
-}
-
-fn render_history_chart(frame: &mut Frame, area: Rect, state: &DashboardState) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Queries (24h) ")
-        .title_bottom(Line::from(vec![
-            Span::styled(" ■", Style::default().fg(Color::Green)),
-            Span::styled(" cache ", Style::default().fg(Color::DarkGray)),
-            Span::styled("■", Style::default().fg(Color::Magenta)),
-            Span::styled(" recursive ", Style::default().fg(Color::DarkGray)),
-            Span::styled("■", Style::default().fg(Color::Blue)),
-            Span::styled(" forwarded ", Style::default().fg(Color::DarkGray)),
-            Span::styled("■", Style::default().fg(Color::Red)),
-            Span::styled(" blocked ", Style::default().fg(Color::DarkGray)),
-        ]));
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    frame.render_widget(StackedBarChart { data: &state.query_history }, inner);
 }
 
 fn render_query_log(frame: &mut Frame, area: Rect, state: &DashboardState) {
