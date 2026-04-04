@@ -13,6 +13,7 @@ use crate::cache::{CacheKey, SharedCache};
 use crate::config::{CacheConfig, Config, ResolverMode, UpstreamServer};
 use crate::dnssec;
 use crate::stats::{DnssecStatus, ResolutionMethod};
+use crate::threat::SharedThreatIntel;
 
 /// Result of resolving a query
 pub struct ResolveResult {
@@ -21,12 +22,13 @@ pub struct ResolveResult {
     pub dnssec: DnssecStatus,
 }
 
-/// Try to resolve a query: check blocklist, then cache, then forward/recurse
+/// Try to resolve a query: check blocklist, then threat detection, then cache, then forward/recurse
 pub async fn resolve(
     request: &Message,
     config: &Arc<Config>,
     cache: &SharedCache,
     blocklist: &SharedBlocklist,
+    threat_intel: &Option<SharedThreatIntel>,
 ) -> Result<ResolveResult, Box<dyn std::error::Error + Send + Sync>> {
     let query = match request.queries().first() {
         Some(q) => q,
@@ -50,6 +52,27 @@ pub async fn resolve(
         }
     }
 
+    // AI threat detection: analyze domain and graylist if suspicious
+    if config.threat.enabled {
+        if let Some(ti) = threat_intel {
+            if let Ok(mut intel) = ti.write() {
+                let flags = intel.analyze_domain(&domain, &config.threat);
+                if !flags.is_empty() && intel.is_graylisted(&domain) {
+                    tracing::debug!(
+                        domain = %domain,
+                        flags = ?flags,
+                        "domain graylisted by threat detection"
+                    );
+                    return Ok(ResolveResult {
+                        response: build_blocked_response(request),
+                        method: ResolutionMethod::Graylisted,
+                        dnssec: DnssecStatus::Skipped,
+                    });
+                }
+            }
+        }
+    }
+
     let cache_key = CacheKey {
         name: domain.to_lowercase(),
         record_type: query.query_type(),
@@ -62,7 +85,7 @@ pub async fn resolve(
 
             // Trigger background prefetch if entry is nearing expiry
             if lookup.needs_prefetch {
-                spawn_prefetch(request.clone(), config.clone(), cache.clone(), blocklist.clone());
+                spawn_prefetch(request.clone(), config.clone(), cache.clone(), blocklist.clone(), threat_intel.clone());
             }
 
             return Ok(ResolveResult {
@@ -136,6 +159,7 @@ fn spawn_prefetch(
     config: Arc<Config>,
     cache: SharedCache,
     blocklist: SharedBlocklist,
+    _threat_intel: Option<SharedThreatIntel>,
 ) {
     tokio::spawn(async move {
         let domain = request

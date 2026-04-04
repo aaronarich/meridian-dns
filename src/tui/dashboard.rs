@@ -25,9 +25,41 @@ pub struct DashboardState {
     pub recursive_queries: u64,
     pub recent_queries: Vec<RecentQuery>,
     pub query_history: Vec<HistoryBucket>,
+    pub graylisted_queries: u64,
     pub blocklist_domain_count: usize,
     pub blocklist_last_refresh: String,
+    pub threat: ThreatInfo,
     pub config: ConfigInfo,
+}
+
+/// Threat detection / graylist summary for the TUI
+pub struct ThreatInfo {
+    pub enabled: bool,
+    pub graylist_count: usize,
+    pub total_flagged: u64,
+    pub total_classifications: u64,
+    pub top_graylisted: Vec<GraylistItem>,
+}
+
+impl Default for ThreatInfo {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            graylist_count: 0,
+            total_flagged: 0,
+            total_classifications: 0,
+            top_graylisted: Vec::new(),
+        }
+    }
+}
+
+pub struct GraylistItem {
+    pub domain: String,
+    pub query_count: u64,
+    pub entropy: f64,
+    pub flags: Vec<String>,
+    pub classification: Option<String>,
+    pub confidence: Option<f64>,
 }
 
 pub struct ConfigInfo {
@@ -129,10 +161,12 @@ impl DashboardState {
             blocked_queries: s.blocked_queries,
             forwarded_queries: s.forwarded_queries,
             recursive_queries: s.recursive_queries,
+            graylisted_queries: s.graylisted_queries,
             recent_queries,
             query_history,
             blocklist_domain_count: 0,
             blocklist_last_refresh: "N/A".to_string(),
+            threat: ThreatInfo::default(),
             config: ConfigInfo::default(),
         }
     }
@@ -148,6 +182,7 @@ impl DashboardState {
         let blocked_queries = v["blocked_queries"].as_u64().unwrap_or(0);
         let forwarded_queries = v["forwarded_queries"].as_u64().unwrap_or(0);
         let recursive_queries = v["recursive_queries"].as_u64().unwrap_or(0);
+        let graylisted_queries = v["graylisted_queries"].as_u64().unwrap_or(0);
         let blocklist_domain_count = v["blocklist_domains"].as_u64().unwrap_or(0) as usize;
         let refresh_secs = v["blocklist_last_refresh_secs_ago"].as_u64().unwrap_or(0);
 
@@ -239,6 +274,42 @@ impl DashboardState {
             upstreams,
         };
 
+        // Parse threat intel
+        let threat_section = &v["threat"];
+        let top_graylisted: Vec<GraylistItem> = threat_section["top_graylisted"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|g| {
+                        let flags: Vec<String> = g["flags"]
+                            .as_array()
+                            .map(|f| f.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                            .unwrap_or_default();
+                        let classification = g["classification"]["category"]
+                            .as_str()
+                            .map(String::from);
+                        let confidence = g["classification"]["confidence"].as_f64();
+                        GraylistItem {
+                            domain: g["domain"].as_str().unwrap_or("?").to_string(),
+                            query_count: g["query_count"].as_u64().unwrap_or(0),
+                            entropy: g["entropy"].as_f64().unwrap_or(0.0),
+                            flags,
+                            classification,
+                            confidence,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let threat_info = ThreatInfo {
+            enabled: threat_section["enabled"].as_bool().unwrap_or(false),
+            graylist_count: threat_section["graylist_count"].as_u64().unwrap_or(0) as usize,
+            total_flagged: threat_section["total_flagged"].as_u64().unwrap_or(0),
+            total_classifications: threat_section["total_classifications"].as_u64().unwrap_or(0),
+            top_graylisted,
+        };
+
         Some(Self {
             mode,
             uptime: Duration::from_secs(uptime_secs),
@@ -248,10 +319,12 @@ impl DashboardState {
             blocked_queries,
             forwarded_queries,
             recursive_queries,
+            graylisted_queries,
             recent_queries,
             query_history,
             blocklist_domain_count,
             blocklist_last_refresh,
+            threat: threat_info,
             config: config_info,
         })
     }
@@ -283,6 +356,7 @@ impl DashboardState {
             blocked_queries: 2_147,
             forwarded_queries: 1_203,
             recursive_queries: 3_191,
+            graylisted_queries: 23,
             recent_queries,
             query_history: (0..144).rev().map(|i| HistoryBucket {
                 mins_ago: i * 10,
@@ -293,6 +367,17 @@ impl DashboardState {
             }).collect(),
             blocklist_domain_count: 84_291,
             blocklist_last_refresh: "2 hours ago".to_string(),
+            threat: ThreatInfo {
+                enabled: true,
+                graylist_count: 7,
+                total_flagged: 12,
+                total_classifications: 5,
+                top_graylisted: vec![
+                    GraylistItem { domain: "xk4jf9a2b7c.evil.com".into(), query_count: 47, entropy: 4.1, flags: vec!["high-entropy".into(), "suspected-dga".into()], classification: Some("malware-c2".into()), confidence: Some(0.87) },
+                    GraylistItem { domain: "trk.analytics-pixel.net".into(), query_count: 31, entropy: 3.6, flags: vec!["high-freq-unknown".into()], classification: Some("ad-tracker".into()), confidence: Some(0.92) },
+                    GraylistItem { domain: "cdn7-metrics.telemetry.io".into(), query_count: 18, entropy: 3.5, flags: vec!["high-freq-unknown".into()], classification: None, confidence: None },
+                ],
+            },
             config: ConfigInfo {
                 listen: "0.0.0.0:53".to_string(),
                 cache_max_entries: 10000,
@@ -328,21 +413,26 @@ fn format_uptime(d: Duration) -> String {
 pub fn render(frame: &mut Frame, state: &DashboardState) {
     let size = frame.area();
 
-    // Top-level layout: header, middle, config, footer
+    // Top-level layout: header, middle, threat, config, footer
+    let threat_height = if state.threat.enabled { 8 } else { 0 };
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),  // header: mode + stats
-            Constraint::Min(10),   // middle: chart + query log
-            Constraint::Length(8), // config: settings panel
-            Constraint::Length(3), // footer: keybinds
+            Constraint::Length(5),             // header: mode + stats
+            Constraint::Min(10),              // middle: chart + query log
+            Constraint::Length(threat_height), // threat detection panel
+            Constraint::Length(8),            // config: settings panel
+            Constraint::Length(3),            // footer: keybinds
         ])
         .split(size);
 
     render_header(frame, outer[0], state);
     render_middle(frame, outer[1], state);
-    render_config(frame, outer[2], state);
-    render_footer(frame, outer[3], state);
+    if state.threat.enabled {
+        render_threat(frame, outer[2], state);
+    }
+    render_config(frame, outer[3], state);
+    render_footer(frame, outer[4], state);
 }
 
 fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
@@ -404,11 +494,11 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
             Span::styled(format_number(state.recursive_queries), Style::default().fg(Color::Magenta)),
         ]),
         Line::from(vec![
-            Span::styled("Cache: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format_number(state.cache_hits), Style::default().fg(Color::Green)),
-            Span::raw("  "),
             Span::styled("Blk: ", Style::default().fg(Color::DarkGray)),
             Span::styled(format_number(state.blocked_queries), Style::default().fg(Color::Red)),
+            Span::raw("  "),
+            Span::styled("Gray: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format_number(state.graylisted_queries), Style::default().fg(Color::Yellow)),
         ]),
     ])
     .block(Block::default().borders(Borders::ALL).title(" Breakdown "));
@@ -611,6 +701,7 @@ fn render_query_log(frame: &mut Frame, area: Rect, state: &DashboardState) {
             let method_color = match q.method.as_str() {
                 "cache" => Color::Green,
                 "blocked" => Color::Red,
+                "graylisted" => Color::Yellow,
                 "forwarding" => Color::Blue,
                 "recursive" => Color::Magenta,
                 _ => Color::White,
@@ -652,6 +743,107 @@ fn render_query_log(frame: &mut Frame, area: Rect, state: &DashboardState) {
     .row_highlight_style(Style::default().add_modifier(Modifier::BOLD));
 
     frame.render_widget(table, area);
+}
+
+fn render_threat(frame: &mut Frame, area: Rect, state: &DashboardState) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(28), // threat summary
+            Constraint::Min(30),   // graylisted domains table
+        ])
+        .split(area);
+
+    // Summary panel
+    let summary = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("Graylisted: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                state.threat.graylist_count.to_string(),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Total flagged: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                state.threat.total_flagged.to_string(),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Classified: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                state.threat.total_classifications.to_string(),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Gray queries: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format_number(state.graylisted_queries),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" AI Threat Detection ")
+            .style(Style::default().fg(Color::Yellow)),
+    );
+    frame.render_widget(summary, chunks[0]);
+
+    // Top graylisted domains
+    let header = Row::new(vec![
+        Cell::from("Domain").style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+        Cell::from("Hits").style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+        Cell::from("Flags").style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+        Cell::from("Classification").style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+    ])
+    .height(1);
+
+    let rows: Vec<Row> = state
+        .threat
+        .top_graylisted
+        .iter()
+        .map(|g| {
+            let classification_text = match (&g.classification, g.confidence) {
+                (Some(cat), Some(conf)) => format!("{} ({:.0}%)", cat, conf * 100.0),
+                (Some(cat), None) => cat.clone(),
+                _ => "pending...".to_string(),
+            };
+            let class_color = match g.classification.as_deref() {
+                Some("malware-c2") | Some("dga") | Some("data-exfil") => Color::Red,
+                Some("ad-tracker") | Some("analytics") => Color::Yellow,
+                Some("cdn") | Some("legitimate") => Color::Green,
+                _ => Color::DarkGray,
+            };
+            Row::new(vec![
+                Cell::from(truncate_domain(&g.domain, 30)),
+                Cell::from(g.query_count.to_string()),
+                Cell::from(g.flags.join(", ")).style(Style::default().fg(Color::Yellow)),
+                Cell::from(classification_text).style(Style::default().fg(class_color)),
+            ])
+        })
+        .collect();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(20),
+            Constraint::Length(6),
+            Constraint::Length(20),
+            Constraint::Min(15),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Graylist (top by query count) "),
+    );
+
+    frame.render_widget(table, chunks[1]);
 }
 
 fn render_config(frame: &mut Frame, area: Rect, state: &DashboardState) {
@@ -750,19 +942,24 @@ pub fn render_with_overlay(
         3
     };
 
+    let threat_height = if state.threat.enabled { 8 } else { 0 };
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),           // header
-            Constraint::Min(10),            // middle
-            Constraint::Length(8),          // config
+            Constraint::Length(5),             // header
+            Constraint::Min(10),              // middle
+            Constraint::Length(threat_height), // threat
+            Constraint::Length(8),            // config
             Constraint::Length(footer_height), // footer / overlay
         ])
         .split(size);
 
     render_header(frame, outer[0], state);
     render_middle(frame, outer[1], state);
-    render_config(frame, outer[2], state);
+    if state.threat.enabled {
+        render_threat(frame, outer[2], state);
+    }
+    render_config(frame, outer[3], state);
 
     if let Some(text) = overlay {
         // Render input overlay instead of normal footer
@@ -775,7 +972,7 @@ pub fn render_with_overlay(
                     .title(" Input ")
                     .style(Style::default().fg(Color::Yellow)),
             );
-        frame.render_widget(overlay_widget, outer[3]);
+        frame.render_widget(overlay_widget, outer[4]);
     } else if let Some(status_text) = status {
         // Render status message in footer
         let footer = Paragraph::new(Line::from(vec![
@@ -793,9 +990,9 @@ pub fn render_with_overlay(
         ]))
         .wrap(Wrap { trim: false })
         .block(Block::default().borders(Borders::ALL).title(" Keys "));
-        frame.render_widget(footer, outer[3]);
+        frame.render_widget(footer, outer[4]);
     } else {
-        render_footer(frame, outer[3], state);
+        render_footer(frame, outer[4], state);
     }
 }
 

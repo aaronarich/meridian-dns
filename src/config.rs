@@ -33,6 +33,8 @@ pub struct Config {
     pub tui: TuiConfig,
     #[serde(default)]
     pub upstream: UpstreamConfig,
+    #[serde(default)]
+    pub threat: ThreatConfig,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -185,6 +187,81 @@ pub struct UpstreamServer {
     pub name: String,
     pub address: String,
     pub protocol: UpstreamProtocol,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ThreatConfig {
+    /// Enable AI threat detection and graylist
+    #[serde(default)]
+    pub enabled: bool,
+    /// Shannon entropy threshold for flagging domains (0.0-5.0, default 3.5)
+    #[serde(default = "default_entropy_threshold")]
+    pub entropy_threshold: f64,
+    /// Minimum queries before frequency-based flagging kicks in
+    #[serde(default = "default_freq_min_queries")]
+    pub frequency_min_queries: u64,
+    /// Queries-per-second rate above which a domain is flagged
+    #[serde(default = "default_freq_rate")]
+    pub frequency_rate_threshold: f64,
+    /// Enable ollama LLM classification of graylisted domains
+    #[serde(default)]
+    pub ollama_enabled: bool,
+    /// Ollama API URL
+    #[serde(default = "default_ollama_url")]
+    pub ollama_url: String,
+    /// Ollama model to use
+    #[serde(default = "default_ollama_model")]
+    pub ollama_model: String,
+    /// How often to run classification (seconds)
+    #[serde(default = "default_classification_interval")]
+    pub classification_interval_secs: u64,
+    /// How many domains to classify per batch
+    #[serde(default = "default_classification_batch")]
+    pub classification_batch_size: usize,
+}
+
+impl Default for ThreatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            entropy_threshold: default_entropy_threshold(),
+            frequency_min_queries: default_freq_min_queries(),
+            frequency_rate_threshold: default_freq_rate(),
+            ollama_enabled: false,
+            ollama_url: default_ollama_url(),
+            ollama_model: default_ollama_model(),
+            classification_interval_secs: default_classification_interval(),
+            classification_batch_size: default_classification_batch(),
+        }
+    }
+}
+
+fn default_entropy_threshold() -> f64 {
+    3.5
+}
+
+fn default_freq_min_queries() -> u64 {
+    10
+}
+
+fn default_freq_rate() -> f64 {
+    0.5
+}
+
+fn default_ollama_url() -> String {
+    "http://localhost:11434".to_string()
+}
+
+fn default_ollama_model() -> String {
+    "gemma2:2b".to_string()
+}
+
+fn default_classification_interval() -> u64 {
+    300 // 5 minutes
+}
+
+fn default_classification_batch() -> usize {
+    5
 }
 
 impl Config {

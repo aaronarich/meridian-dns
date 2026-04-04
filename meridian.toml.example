@@ -19,6 +19,17 @@ url = "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=
 name = "stevenblack"
 url = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
 
+[threat]
+enabled = true                    # enable AI threat detection and graylist
+entropy_threshold = 3.5           # Shannon entropy threshold for flagging (0.0-5.0)
+frequency_min_queries = 10        # min queries before frequency-based flagging
+frequency_rate_threshold = 0.5    # queries/sec above which domain is flagged
+ollama_enabled = true             # enable LLM classification via ollama
+ollama_url = "http://localhost:11434"
+ollama_model = "gemma2:2b"        # small model suitable for Pi 4
+classification_interval_secs = 300 # classify pending domains every 5 min
+classification_batch_size = 5     # how many domains per classification run
+
 [metrics]
 enabled = true
 port = 9053
