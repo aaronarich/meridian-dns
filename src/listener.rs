@@ -13,6 +13,7 @@ use crate::cache::SharedCache;
 use crate::config::Config;
 use crate::resolver;
 use crate::stats::{DnssecStatus, QueryLogEntry, ResolutionMethod, SharedStats};
+use crate::threat::SharedThreatIntel;
 
 /// Shared context passed to query handlers
 #[derive(Clone)]
@@ -21,6 +22,7 @@ struct HandlerCtx {
     cache: SharedCache,
     config: Arc<Config>,
     blocklist: SharedBlocklist,
+    threat_intel: Option<SharedThreatIntel>,
 }
 
 /// Start both UDP and TCP listeners
@@ -29,12 +31,14 @@ pub async fn start(
     stats: SharedStats,
     cache: SharedCache,
     blocklist: SharedBlocklist,
+    threat_intel: Option<SharedThreatIntel>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ctx = HandlerCtx {
         stats,
         cache,
         config,
         blocklist,
+        threat_intel,
     };
 
     let addr = ctx.config.listen;
@@ -176,7 +180,7 @@ async fn handle_query(buf: &[u8], ctx: &HandlerCtx) -> Vec<u8> {
 
     // Try to resolve the query
     let (response_bytes, method, dnssec_status) =
-        match resolver::resolve(&request, &ctx.config, &ctx.cache, &ctx.blocklist).await {
+        match resolver::resolve(&request, &ctx.config, &ctx.cache, &ctx.blocklist, &ctx.threat_intel).await {
             Ok(result) => {
                 let bytes = result.response.to_vec().unwrap_or_else(|_| {
                     build_servfail(id, &request)
@@ -270,6 +274,7 @@ mod tests {
             cache: new_shared_cache(100, 0, 300, false, 0.1),
             config: Arc::new(config),
             blocklist: new_shared_blocklist(),
+            threat_intel: None,
         }
     }
 

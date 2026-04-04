@@ -9,12 +9,14 @@ use tracing::{debug, error, info, warn};
 use crate::blocklist::{self, SharedBlocklist};
 use crate::config::{BlocklistSource, Config};
 use crate::stats::SharedStats;
+use crate::threat::SharedThreatIntel;
 
 /// Start the metrics HTTP server
 pub async fn start(
     port: u16,
     stats: SharedStats,
     blocklist: SharedBlocklist,
+    threat_intel: Option<SharedThreatIntel>,
     config: Arc<Config>,
     config_path: PathBuf,
 ) {
@@ -42,6 +44,7 @@ pub async fn start(
 
         let stats = stats.clone();
         let blocklist = blocklist.clone();
+        let threat_intel = threat_intel.clone();
         let config = config.clone();
         let config_path = config_path.clone();
 
@@ -56,8 +59,15 @@ pub async fn start(
 
             let response = match (method.as_str(), path.as_str()) {
                 ("GET", "/") | ("GET", "") => {
-                    let json = build_metrics_json(&stats, &blocklist, &config);
+                    let json = build_metrics_json(&stats, &blocklist, &threat_intel, &config);
                     http_response(200, "application/json", &json)
+                }
+                ("GET", "/threat/graylist") => {
+                    let json = build_graylist_json(&threat_intel);
+                    http_response(200, "application/json", &json)
+                }
+                ("POST", "/threat/approve") => {
+                    handle_threat_approve(&body, &threat_intel)
                 }
                 ("POST", "/blocklist/refresh") => {
                     handle_blocklist_refresh(&blocklist, &config_path).await
@@ -224,9 +234,86 @@ async fn handle_blocklist_remove(
     http_response(200, "application/json", r#"{"status":"ok","action":"remove"}"#)
 }
 
+fn handle_threat_approve(body: &str, threat_intel: &Option<SharedThreatIntel>) -> String {
+    let ti = match threat_intel {
+        Some(ti) => ti,
+        None => return http_response(400, "application/json", r#"{"error":"threat detection not enabled"}"#),
+    };
+
+    let v: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return http_response(400, "application/json", &format!(r#"{{"error":"invalid JSON: {}"}}"#, e));
+        }
+    };
+
+    let domain = match v["domain"].as_str() {
+        Some(d) if !d.is_empty() => d.to_string(),
+        _ => return http_response(400, "application/json", r#"{"error":"missing 'domain' field"}"#),
+    };
+
+    if let Ok(mut intel) = ti.write() {
+        intel.approve_domain(&domain);
+        info!(domain = %domain, "domain approved via API, removed from graylist");
+        http_response(200, "application/json", r#"{"status":"ok","action":"approve"}"#)
+    } else {
+        http_response(500, "application/json", r#"{"error":"lock error"}"#)
+    }
+}
+
+fn build_graylist_json(threat_intel: &Option<SharedThreatIntel>) -> String {
+    let ti = match threat_intel {
+        Some(ti) => ti,
+        None => return r#"{"graylist":[],"enabled":false}"#.to_string(),
+    };
+
+    let intel = match ti.read() {
+        Ok(i) => i,
+        Err(_) => return r#"{"graylist":[],"error":"lock"}"#.to_string(),
+    };
+
+    let mut entries: Vec<&crate::threat::GraylistEntry> = intel.graylist.values().collect();
+    entries.sort_by(|a, b| b.query_count.cmp(&a.query_count));
+
+    let items: Vec<String> = entries
+        .iter()
+        .take(50)
+        .map(|e| {
+            let flags: Vec<String> = e.flags.iter().map(|f| format!("\"{}\"", f)).collect();
+            let classification = match &e.classification {
+                Some(c) => format!(
+                    r#"{{"category":"{}","confidence":{:.2},"explanation":"{}"}}"#,
+                    escape_json(&c.category),
+                    c.confidence,
+                    escape_json(&c.explanation),
+                ),
+                None => "null".to_string(),
+            };
+            format!(
+                r#"{{"domain":"{}","query_count":{},"entropy":{:.2},"flags":[{}],"classification":{},"age_secs":{}}}"#,
+                escape_json(&e.domain),
+                e.query_count,
+                e.entropy,
+                flags.join(","),
+                classification,
+                e.first_seen.elapsed().as_secs(),
+            )
+        })
+        .collect();
+
+    format!(
+        r#"{{"graylist":[{}],"total_flagged":{},"total_classifications":{},"approved_count":{}}}"#,
+        items.join(","),
+        intel.total_flagged,
+        intel.total_classifications,
+        intel.approved.len(),
+    )
+}
+
 fn build_metrics_json(
     stats: &SharedStats,
     blocklist: &SharedBlocklist,
+    threat_intel: &Option<SharedThreatIntel>,
     config: &Config,
 ) -> String {
     let s = stats.read().unwrap();
@@ -309,8 +396,59 @@ fn build_metrics_json(
         })
         .collect();
 
+    // Threat intel summary
+    let (graylist_count, threat_total_flagged, threat_classifications, threat_enabled) =
+        match threat_intel {
+            Some(ti) => match ti.read() {
+                Ok(intel) => (
+                    intel.graylist.len(),
+                    intel.total_flagged,
+                    intel.total_classifications,
+                    true,
+                ),
+                Err(_) => (0, 0, 0, true),
+            },
+            None => (0, 0, 0, false),
+        };
+
+    // Build top graylisted entries for the main dashboard
+    let graylist_top: Vec<String> = match threat_intel {
+        Some(ti) => match ti.read() {
+            Ok(intel) => {
+                let mut entries: Vec<_> = intel.graylist.values().collect();
+                entries.sort_by(|a, b| b.query_count.cmp(&a.query_count));
+                entries
+                    .iter()
+                    .take(10)
+                    .map(|e| {
+                        let flags: Vec<String> = e.flags.iter().map(|f| format!("\"{}\"", f)).collect();
+                        let classification = match &e.classification {
+                            Some(c) => format!(
+                                r#"{{"category":"{}","confidence":{:.2},"explanation":"{}"}}"#,
+                                escape_json(&c.category),
+                                c.confidence,
+                                escape_json(&c.explanation),
+                            ),
+                            None => "null".to_string(),
+                        };
+                        format!(
+                            r#"{{"domain":"{}","query_count":{},"entropy":{:.2},"flags":[{}],"classification":{}}}"#,
+                            escape_json(&e.domain),
+                            e.query_count,
+                            e.entropy,
+                            flags.join(","),
+                            classification,
+                        )
+                    })
+                    .collect()
+            }
+            Err(_) => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+
     format!(
-        r#"{{"uptime_secs":{},"total_queries":{},"cache_hits":{},"cache_hit_rate":{:.1},"blocked_queries":{},"forwarded_queries":{},"recursive_queries":{},"blocklist_domains":{},"blocklist_last_refresh_secs_ago":{},"query_history":[{}],"recent_queries":[{}],"config":{{"mode":"{}","listen":"{}","cache_max_entries":{},"blocklist_enabled":{},"blocklist_refresh_hours":{},"blocklist_sources":[{}],"upstreams":[{}]}}}}"#,
+        r#"{{"uptime_secs":{},"total_queries":{},"cache_hits":{},"cache_hit_rate":{:.1},"blocked_queries":{},"forwarded_queries":{},"recursive_queries":{},"graylisted_queries":{},"blocklist_domains":{},"blocklist_last_refresh_secs_ago":{},"threat":{{"enabled":{},"graylist_count":{},"total_flagged":{},"total_classifications":{},"top_graylisted":[{}]}},"query_history":[{}],"recent_queries":[{}],"config":{{"mode":"{}","listen":"{}","cache_max_entries":{},"blocklist_enabled":{},"blocklist_refresh_hours":{},"blocklist_sources":[{}],"upstreams":[{}]}}}}"#,
         uptime_secs,
         s.total_queries,
         s.cache_hits,
@@ -318,8 +456,14 @@ fn build_metrics_json(
         s.blocked_queries,
         s.forwarded_queries,
         s.recursive_queries,
+        s.graylisted_queries,
         blocklist_count,
         blocklist_last_refresh,
+        threat_enabled,
+        graylist_count,
+        threat_total_flagged,
+        threat_classifications,
+        graylist_top.join(","),
         history.join(","),
         recent.join(","),
         mode,
@@ -364,13 +508,14 @@ protocol = "dot"
         let stats = new_shared_stats();
         let blocklist = new_shared_blocklist();
         let config = test_config();
-        let json = build_metrics_json(&stats, &blocklist, &config);
+        let json = build_metrics_json(&stats, &blocklist, &None, &config);
 
         assert!(json.contains("\"total_queries\":0"));
         assert!(json.contains("\"cache_hit_rate\":0.0"));
         assert!(json.contains("\"recent_queries\":[]"));
         assert!(json.contains("\"mode\":\"recursive\""));
         assert!(json.contains("\"quad9\""));
+        assert!(json.contains("\"graylisted_queries\":0"));
     }
 
     #[test]
@@ -391,7 +536,7 @@ protocol = "dot"
             });
         }
 
-        let json = build_metrics_json(&stats, &blocklist, &config);
+        let json = build_metrics_json(&stats, &blocklist, &None, &config);
         assert!(json.contains("\"total_queries\":1"));
         assert!(json.contains("\"forwarded_queries\":1"));
         assert!(json.contains("example.com"));

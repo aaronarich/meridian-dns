@@ -6,6 +6,7 @@ mod listener;
 mod metrics;
 mod resolver;
 mod stats;
+mod threat;
 mod tui;
 
 use std::sync::Arc;
@@ -95,21 +96,32 @@ async fn main() {
             // Spawn background refresh task
             blocklist::spawn_refresh_task(config.blocklist.clone(), shared_blocklist.clone());
 
+            // Initialize AI threat detection if enabled
+            let shared_threat_intel = if config.threat.enabled {
+                let ti = threat::new_shared_threat_intel();
+                info!("AI threat detection enabled (ollama: {})", config.threat.ollama_enabled);
+                threat::spawn_classification_task(config.threat.clone(), ti.clone());
+                Some(ti)
+            } else {
+                None
+            };
+
             let config = Arc::new(config);
 
             // Start metrics HTTP server
             if config.metrics.enabled {
                 let metrics_stats = shared_stats.clone();
                 let metrics_blocklist = shared_blocklist.clone();
+                let metrics_threat = shared_threat_intel.clone();
                 let metrics_port = config.metrics.port;
                 let metrics_config = config.clone();
                 let metrics_config_path = cli.config.clone();
                 tokio::spawn(async move {
-                    metrics::start(metrics_port, metrics_stats, metrics_blocklist, metrics_config, metrics_config_path).await;
+                    metrics::start(metrics_port, metrics_stats, metrics_blocklist, metrics_threat, metrics_config, metrics_config_path).await;
                 });
             }
 
-            if let Err(e) = listener::start(config, shared_stats, shared_cache, shared_blocklist).await {
+            if let Err(e) = listener::start(config, shared_stats, shared_cache, shared_blocklist, shared_threat_intel).await {
                 error!("listener error: {e}");
                 std::process::exit(1);
             }
