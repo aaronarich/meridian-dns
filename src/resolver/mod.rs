@@ -52,22 +52,17 @@ pub async fn resolve(
         }
     }
 
-    // AI threat detection: analyze domain and graylist if suspicious
+    // AI threat detection: analyze domain (observe-only, does not block)
     if config.threat.enabled {
         if let Some(ti) = threat_intel {
             if let Ok(mut intel) = ti.write() {
                 let flags = intel.analyze_domain(&domain, &config.threat);
-                if !flags.is_empty() && intel.is_graylisted(&domain) {
+                if !flags.is_empty() {
                     tracing::debug!(
                         domain = %domain,
                         flags = ?flags,
-                        "domain graylisted by threat detection"
+                        "domain flagged by threat detection (observe-only)"
                     );
-                    return Ok(ResolveResult {
-                        response: build_blocked_response(request),
-                        method: ResolutionMethod::Graylisted,
-                        dnssec: DnssecStatus::Skipped,
-                    });
                 }
             }
         }

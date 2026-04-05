@@ -69,6 +69,9 @@ pub async fn start(
                 ("POST", "/threat/approve") => {
                     handle_threat_approve(&body, &threat_intel)
                 }
+                ("POST", "/threat/block") => {
+                    handle_threat_block(&body, &threat_intel, &blocklist)
+                }
                 ("POST", "/blocklist/refresh") => {
                     handle_blocklist_refresh(&blocklist, &config_path).await
                 }
@@ -261,6 +264,44 @@ fn handle_threat_approve(body: &str, threat_intel: &Option<SharedThreatIntel>) -
     }
 }
 
+fn handle_threat_block(
+    body: &str,
+    threat_intel: &Option<SharedThreatIntel>,
+    blocklist: &SharedBlocklist,
+) -> String {
+    let ti = match threat_intel {
+        Some(ti) => ti,
+        None => return http_response(400, "application/json", r#"{"error":"threat detection not enabled"}"#),
+    };
+
+    let v: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return http_response(400, "application/json", &format!(r#"{{"error":"invalid JSON: {}"}}"#, e));
+        }
+    };
+
+    let domain = match v["domain"].as_str() {
+        Some(d) if !d.is_empty() => d.trim_end_matches('.').to_lowercase(),
+        _ => return http_response(400, "application/json", r#"{"error":"missing 'domain' field"}"#),
+    };
+
+    // Add to blocklist
+    if let Ok(mut bl) = blocklist.write() {
+        bl.add_domain(domain.clone());
+    } else {
+        return http_response(500, "application/json", r#"{"error":"blocklist lock error"}"#);
+    }
+
+    // Remove from graylist
+    if let Ok(mut intel) = ti.write() {
+        intel.graylist.remove(&domain);
+    }
+
+    info!(domain = %domain, "graylisted domain blocked via API, added to blocklist");
+    http_response(200, "application/json", r#"{"status":"ok","action":"block"}"#)
+}
+
 fn build_graylist_json(threat_intel: &Option<SharedThreatIntel>) -> String {
     let ti = match threat_intel {
         Some(ti) => ti,
@@ -397,18 +438,19 @@ fn build_metrics_json(
         .collect();
 
     // Threat intel summary
-    let (graylist_count, threat_total_flagged, threat_classifications, threat_enabled) =
+    let (graylist_count, threat_total_flagged, threat_classifications, threat_approved, threat_enabled) =
         match threat_intel {
             Some(ti) => match ti.read() {
                 Ok(intel) => (
                     intel.graylist.len(),
                     intel.total_flagged,
                     intel.total_classifications,
+                    intel.approved.len(),
                     true,
                 ),
-                Err(_) => (0, 0, 0, true),
+                Err(_) => (0, 0, 0, 0, true),
             },
-            None => (0, 0, 0, false),
+            None => (0, 0, 0, 0, false),
         };
 
     // Build top graylisted entries for the main dashboard
@@ -448,7 +490,7 @@ fn build_metrics_json(
     };
 
     format!(
-        r#"{{"uptime_secs":{},"total_queries":{},"cache_hits":{},"cache_hit_rate":{:.1},"blocked_queries":{},"forwarded_queries":{},"recursive_queries":{},"graylisted_queries":{},"blocklist_domains":{},"blocklist_last_refresh_secs_ago":{},"threat":{{"enabled":{},"graylist_count":{},"total_flagged":{},"total_classifications":{},"top_graylisted":[{}]}},"query_history":[{}],"recent_queries":[{}],"config":{{"mode":"{}","listen":"{}","cache_max_entries":{},"blocklist_enabled":{},"blocklist_refresh_hours":{},"blocklist_sources":[{}],"upstreams":[{}]}}}}"#,
+        r#"{{"uptime_secs":{},"total_queries":{},"cache_hits":{},"cache_hit_rate":{:.1},"blocked_queries":{},"forwarded_queries":{},"recursive_queries":{},"blocklist_domains":{},"blocklist_last_refresh_secs_ago":{},"threat":{{"enabled":{},"graylist_count":{},"total_flagged":{},"total_classifications":{},"approved_count":{},"top_graylisted":[{}]}},"query_history":[{}],"recent_queries":[{}],"config":{{"mode":"{}","listen":"{}","cache_max_entries":{},"blocklist_enabled":{},"blocklist_refresh_hours":{},"blocklist_sources":[{}],"upstreams":[{}]}}}}"#,
         uptime_secs,
         s.total_queries,
         s.cache_hits,
@@ -456,13 +498,13 @@ fn build_metrics_json(
         s.blocked_queries,
         s.forwarded_queries,
         s.recursive_queries,
-        s.graylisted_queries,
         blocklist_count,
         blocklist_last_refresh,
         threat_enabled,
         graylist_count,
         threat_total_flagged,
         threat_classifications,
+        threat_approved,
         graylist_top.join(","),
         history.join(","),
         recent.join(","),
@@ -515,7 +557,6 @@ protocol = "dot"
         assert!(json.contains("\"recent_queries\":[]"));
         assert!(json.contains("\"mode\":\"recursive\""));
         assert!(json.contains("\"quad9\""));
-        assert!(json.contains("\"graylisted_queries\":0"));
     }
 
     #[test]

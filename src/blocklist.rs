@@ -29,6 +29,13 @@ impl Blocklist {
         self.domains.contains(&normalized)
     }
 
+    /// Add a single domain to the blocklist
+    pub fn add_domain(&mut self, domain: String) {
+        let normalized = domain.trim_end_matches('.').to_lowercase();
+        self.domains.insert(normalized);
+        self.domain_count = self.domains.len();
+    }
+
     /// Replace the blocklist contents with new domains
     fn update(&mut self, domains: HashSet<String>) {
         self.domain_count = domains.len();

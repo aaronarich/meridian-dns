@@ -9,7 +9,6 @@ pub enum ResolutionMethod {
     Recursive,
     Forwarding,
     Blocked,
-    Graylisted,
 }
 
 impl std::fmt::Display for ResolutionMethod {
@@ -19,7 +18,6 @@ impl std::fmt::Display for ResolutionMethod {
             ResolutionMethod::Recursive => write!(f, "recursive"),
             ResolutionMethod::Forwarding => write!(f, "forwarding"),
             ResolutionMethod::Blocked => write!(f, "blocked"),
-            ResolutionMethod::Graylisted => write!(f, "graylisted"),
         }
     }
 }
@@ -64,7 +62,6 @@ pub struct ResolverStats {
     pub blocked_queries: u64,
     pub forwarded_queries: u64,
     pub recursive_queries: u64,
-    pub graylisted_queries: u64,
     pub recent_queries: VecDeque<QueryLogEntry>,
     pub queries_per_second: VecDeque<(Instant, u64)>,
     /// Rolling 24-hour query history in 10-minute buckets
@@ -84,7 +81,6 @@ pub struct QueryBucket {
     pub recursive: u64,
     pub forwarded: u64,
     pub blocked: u64,
-    pub graylisted: u64,
 }
 
 impl QueryBucket {
@@ -95,12 +91,11 @@ impl QueryBucket {
             recursive: 0,
             forwarded: 0,
             blocked: 0,
-            graylisted: 0,
         }
     }
 
     pub fn total(&self) -> u64 {
-        self.cache + self.recursive + self.forwarded + self.blocked + self.graylisted
+        self.cache + self.recursive + self.forwarded + self.blocked
     }
 
     fn record(&mut self, method: &ResolutionMethod) {
@@ -109,7 +104,6 @@ impl QueryBucket {
             ResolutionMethod::Recursive => self.recursive += 1,
             ResolutionMethod::Forwarding => self.forwarded += 1,
             ResolutionMethod::Blocked => self.blocked += 1,
-            ResolutionMethod::Graylisted => self.graylisted += 1,
         }
     }
 
@@ -131,7 +125,6 @@ impl ResolverStats {
             blocked_queries: 0,
             forwarded_queries: 0,
             recursive_queries: 0,
-            graylisted_queries: 0,
             recent_queries: VecDeque::with_capacity(MAX_RECENT_QUERIES),
             queries_per_second: VecDeque::with_capacity(MAX_QPS_SAMPLES),
             query_history,
@@ -145,7 +138,6 @@ impl ResolverStats {
             ResolutionMethod::Blocked => self.blocked_queries += 1,
             ResolutionMethod::Forwarding => self.forwarded_queries += 1,
             ResolutionMethod::Recursive => self.recursive_queries += 1,
-            ResolutionMethod::Graylisted => self.graylisted_queries += 1,
         }
 
         // Update query history bucket

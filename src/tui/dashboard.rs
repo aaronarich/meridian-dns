@@ -25,7 +25,6 @@ pub struct DashboardState {
     pub recursive_queries: u64,
     pub recent_queries: Vec<RecentQuery>,
     pub query_history: Vec<HistoryBucket>,
-    pub graylisted_queries: u64,
     pub blocklist_domain_count: usize,
     pub blocklist_last_refresh: String,
     pub threat: ThreatInfo,
@@ -38,6 +37,7 @@ pub struct ThreatInfo {
     pub graylist_count: usize,
     pub total_flagged: u64,
     pub total_classifications: u64,
+    pub approved_count: usize,
     pub top_graylisted: Vec<GraylistItem>,
 }
 
@@ -48,6 +48,7 @@ impl Default for ThreatInfo {
             graylist_count: 0,
             total_flagged: 0,
             total_classifications: 0,
+            approved_count: 0,
             top_graylisted: Vec::new(),
         }
     }
@@ -161,7 +162,6 @@ impl DashboardState {
             blocked_queries: s.blocked_queries,
             forwarded_queries: s.forwarded_queries,
             recursive_queries: s.recursive_queries,
-            graylisted_queries: s.graylisted_queries,
             recent_queries,
             query_history,
             blocklist_domain_count: 0,
@@ -182,7 +182,6 @@ impl DashboardState {
         let blocked_queries = v["blocked_queries"].as_u64().unwrap_or(0);
         let forwarded_queries = v["forwarded_queries"].as_u64().unwrap_or(0);
         let recursive_queries = v["recursive_queries"].as_u64().unwrap_or(0);
-        let graylisted_queries = v["graylisted_queries"].as_u64().unwrap_or(0);
         let blocklist_domain_count = v["blocklist_domains"].as_u64().unwrap_or(0) as usize;
         let refresh_secs = v["blocklist_last_refresh_secs_ago"].as_u64().unwrap_or(0);
 
@@ -307,6 +306,7 @@ impl DashboardState {
             graylist_count: threat_section["graylist_count"].as_u64().unwrap_or(0) as usize,
             total_flagged: threat_section["total_flagged"].as_u64().unwrap_or(0),
             total_classifications: threat_section["total_classifications"].as_u64().unwrap_or(0),
+            approved_count: threat_section["approved_count"].as_u64().unwrap_or(0) as usize,
             top_graylisted,
         };
 
@@ -319,7 +319,6 @@ impl DashboardState {
             blocked_queries,
             forwarded_queries,
             recursive_queries,
-            graylisted_queries,
             recent_queries,
             query_history,
             blocklist_domain_count,
@@ -356,7 +355,6 @@ impl DashboardState {
             blocked_queries: 2_147,
             forwarded_queries: 1_203,
             recursive_queries: 3_191,
-            graylisted_queries: 23,
             recent_queries,
             query_history: (0..144).rev().map(|i| HistoryBucket {
                 mins_ago: i * 10,
@@ -372,6 +370,7 @@ impl DashboardState {
                 graylist_count: 7,
                 total_flagged: 12,
                 total_classifications: 5,
+                approved_count: 3,
                 top_graylisted: vec![
                     GraylistItem { domain: "xk4jf9a2b7c.evil.com".into(), query_count: 47, entropy: 4.1, flags: vec!["high-entropy".into(), "suspected-dga".into()], classification: Some("malware-c2".into()), confidence: Some(0.87) },
                     GraylistItem { domain: "trk.analytics-pixel.net".into(), query_count: 31, entropy: 3.6, flags: vec!["high-freq-unknown".into()], classification: Some("ad-tracker".into()), confidence: Some(0.92) },
@@ -494,11 +493,11 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
             Span::styled(format_number(state.recursive_queries), Style::default().fg(Color::Magenta)),
         ]),
         Line::from(vec![
+            Span::styled("Cache: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format_number(state.cache_hits), Style::default().fg(Color::Green)),
+            Span::raw("  "),
             Span::styled("Blk: ", Style::default().fg(Color::DarkGray)),
             Span::styled(format_number(state.blocked_queries), Style::default().fg(Color::Red)),
-            Span::raw("  "),
-            Span::styled("Gray: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format_number(state.graylisted_queries), Style::default().fg(Color::Yellow)),
         ]),
     ])
     .block(Block::default().borders(Borders::ALL).title(" Breakdown "));
@@ -701,7 +700,6 @@ fn render_query_log(frame: &mut Frame, area: Rect, state: &DashboardState) {
             let method_color = match q.method.as_str() {
                 "cache" => Color::Green,
                 "blocked" => Color::Red,
-                "graylisted" => Color::Yellow,
                 "forwarding" => Color::Blue,
                 "recursive" => Color::Magenta,
                 _ => Color::White,
@@ -778,10 +776,10 @@ fn render_threat(frame: &mut Frame, area: Rect, state: &DashboardState) {
             ),
         ]),
         Line::from(vec![
-            Span::styled("Gray queries: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Approved: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format_number(state.graylisted_queries),
-                Style::default().fg(Color::Yellow),
+                state.threat.approved_count.to_string(),
+                Style::default().fg(Color::Green),
             ),
         ]),
     ])
